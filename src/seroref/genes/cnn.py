@@ -1,0 +1,1238 @@
+"""Classifying gene roles from amino acid sequences using a Multi-Scale 1D-CNN
+trained via compiled Numba AdamW backpropagation with dual (max + average) pooling.
+"""
+
+from collections.abc import Sequence
+from functools import cache
+from importlib.resources import as_file, files
+from pathlib import Path
+from typing import Any, Self
+
+import numpy as np
+from numba import njit, prange
+from seroverse.core.seq.alphabet import Alphabet
+from seroverse.core.seq.seq import Sequence as SeqRecord
+from seroverse.core.seq.seq import Sequences
+
+from seroref.genes.models import Genes
+from seroref.genes.roles import GeneRole
+
+
+class GeneRoleClassifier:
+    r"""Classifies `GeneRole`s from amino acid sequences using a Multi-Scale 1D-CNN with Dual Pooling.
+
+    Learns representations from variable-length sequence token arrays using an embedding layer,
+    multi-scale 1D convolutions (e.g. receptive fields 5, 11, 17), ReLU activation, emergent dual
+    pooling (`[conv_max, conv_avg]`), a dense role classification head, and a joint 1-bit genomic
+    `source` readout head (`0 = bacterial`, `1 = phage/prophage`). Optimization is performed via a
+    parallel compiled Numba AdamW training kernel with exact gradient routing.
+
+    Attributes:
+        vocab_size: Number of discrete tokens in sequence vocabulary (default 23: 22 AMINO tokens + 1 unknown/pad).
+        embed_dim: Dimensionality of token embedding vectors.
+        num_filters: Number of 1D convolutional feature channels across all kernel sizes.
+        kernel_size: Width of 1D convolution receptive field window (int), or tuple of multi-scale
+            kernel sizes (e.g. `(5, 9, 13)`).
+        learning_rate: AdamW step size hyperparameter.
+        epochs: Number of complete training epochs over dataset.
+        batch_size: Mini-batch size for parallel AdamW gradient accumulation and updates.
+        weight_decay: Decoupled L2 weight decay coefficient applied to model parameters.
+        random_state: Optional seed for reproducible parameter initialization and sample shuffling.
+        class_weight: Optional `"balanced"` inverse-frequency class weighting or `None`.
+    """
+
+    classes_: np.ndarray[tuple[int], np.dtype[Any]]
+    embedding_: np.ndarray[tuple[int, int], np.dtype[np.float32]]
+    conv_w_: np.ndarray[tuple[int, int, int], np.dtype[np.float32]]
+    conv_b_: np.ndarray[tuple[int], np.dtype[np.float32]]
+    dense_w_: np.ndarray[tuple[int, int], np.dtype[np.float32]]
+    dense_b_: np.ndarray[tuple[int], np.dtype[np.float32]]
+    source_w_: np.ndarray[tuple[int], np.dtype[np.float32]]
+    source_b_: np.ndarray[tuple[int], np.dtype[np.float32]]
+    loss_history_: list[float]
+    lut_: np.ndarray[tuple[int, int, int], np.dtype[np.float32]]
+    k_sizes_: np.ndarray[tuple[int], np.dtype[np.int32]]
+    unique_ks_: np.ndarray[tuple[int], np.dtype[np.int32]]
+
+    def __init__(
+        self,
+        vocab_size: int = 23,
+        embed_dim: int = 16,
+        num_filters: int = 64,
+        kernel_size: int | tuple[int, ...] = (5, 9, 13),
+        learning_rate: float = 0.01,
+        epochs: int = 20,
+        batch_size: int = 32,
+        weight_decay: float = 1e-4,
+        random_state: int | None = None,
+        class_weight: str | None = "balanced",
+    ) -> None:
+        """Initialize the `GeneRoleClassifier` with architecture and optimizer hyperparameters."""
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
+        self.num_filters = num_filters
+        self.kernel_size = kernel_size
+        self.learning_rate = learning_rate
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.weight_decay = weight_decay
+        self.random_state = random_state
+        self.class_weight = class_weight
+
+    @property
+    def is_fitted(self) -> bool:
+        """Return `True` if all model parameters have been fitted or loaded."""
+        return all(
+            getattr(self, attr, None) is not None
+            for attr in ("classes_", "embedding_", "conv_w_", "conv_b_", "dense_w_", "dense_b_", "k_sizes_")
+        )
+
+    @property
+    def num_classes(self) -> int:
+        """Number of target classes learned by the fitted model."""
+        return len(self.classes_) if getattr(self, "classes_", None) is not None else 0
+
+    @property
+    def feature_dim(self) -> int:
+        """Dimensionality of the penultimate 1D-CNN dual-pooling (`[conv_max, conv_avg]`) feature vector."""
+        if getattr(self, "dense_w_", None) is not None:
+            return int(self.dense_w_.shape[0])
+        return 2 * int(self.num_filters)
+
+    def _pack_ragged(
+        self,
+        X: Genes | Sequences | Sequence[Any] | tuple[np.ndarray, np.ndarray],
+    ) -> tuple[np.ndarray[tuple[int], np.dtype[np.uint8]], np.ndarray[tuple[int], np.dtype[np.int64]]]:
+        """Pack sequence inputs into a flat `uint8` token array (`0..vocab_size-1`) and `int64` CSR `offsets`."""
+        unk_tok = np.uint8(max(0, self.vocab_size - 1))
+
+        if isinstance(X, Genes):
+            X = X.translations
+
+        if isinstance(X, Sequences):
+            raw = X.seqs
+            if len(raw) == 0:
+                return np.empty(0, dtype=np.uint8), X.indptr.astype(np.int64, copy=False)
+            if int(np.max(raw)) >= self.vocab_size:
+                encoded = Alphabet.AMINO.encode(raw)
+                flat_u8 = np.minimum(encoded, unk_tok)
+            else:
+                flat_u8 = raw.astype(np.uint8, copy=False)
+            return flat_u8, X.indptr.astype(np.int64, copy=False)
+
+        if isinstance(X, tuple) and len(X) == 2 and isinstance(X[0], np.ndarray) and isinstance(X[1], np.ndarray):
+            raw_flat = X[0]
+            if len(raw_flat) > 0 and raw_flat.dtype == np.uint8 and int(np.max(raw_flat)) >= self.vocab_size:
+                flat_u8 = np.minimum(Alphabet.AMINO.encode(raw_flat), unk_tok)
+            else:
+                flat_u8 = np.clip(raw_flat, 0, int(unk_tok)).astype(np.uint8, copy=False)
+            offsets = X[1].astype(np.int64, copy=False)
+            if len(offsets) > 0 and offsets[-1] != len(flat_u8):
+                offsets = np.append(offsets, len(flat_u8))
+            return flat_u8, offsets
+
+        seq_list = list(X)
+        n_seqs = len(seq_list)
+        if n_seqs == 0:
+            return np.empty(0, dtype=np.uint8), np.zeros(1, dtype=np.int64)
+
+        first = seq_list[0]
+        if isinstance(first, (bytes, bytearray, str, SeqRecord)):
+            bytes_list = [
+                s.seq if isinstance(s, SeqRecord) else (s.encode("ascii") if isinstance(s, str) else bytes(s))
+                for s in seq_list
+            ]
+            seqs_obj = Sequences.from_bytes(bytes_list)
+            encoded = Alphabet.AMINO.encode(seqs_obj.seqs)
+            return np.minimum(encoded, unk_tok), seqs_obj.indptr.astype(np.int64, copy=False)
+
+        offsets = np.zeros(n_seqs + 1, dtype=np.int64)
+        total_len = sum(len(s) for s in seq_list)
+        flat = np.empty(total_len, dtype=np.uint8)
+        curr = 0
+        for i, s in enumerate(seq_list):
+            n = len(s)
+            if n > 0:
+                arr = np.asarray(s)
+                if arr.dtype == np.uint8 and int(np.max(arr)) >= self.vocab_size:
+                    flat[curr : curr + n] = np.minimum(Alphabet.AMINO.encode(arr), unk_tok)
+                else:
+                    flat[curr : curr + n] = np.clip(arr, 0, int(unk_tok)).astype(np.uint8, copy=False)
+            curr += n
+            offsets[i + 1] = curr
+        return flat, offsets
+
+    def fit(
+        self,
+        X: Genes | Sequences | Sequence[Any] | tuple[np.ndarray, np.ndarray],
+        y: Sequence[int | GeneRole] | np.ndarray,
+        sample_weight: Sequence[float] | np.ndarray | None = None,
+        *,
+        y_source: Sequence[int] | np.ndarray | None = None,
+        source_loss_weight: float = 0.25,
+        init_from: GeneRoleClassifier | None = None,
+        backbone_lr_scale: float = 1.0,
+    ) -> Self:
+        """Fit the 1D-CNN using parallel mini-batch AdamW optimization over ragged token sequences."""
+        y_raw = np.asarray(y)
+        if len(y_raw) == 0:
+            raise ValueError("Training dataset cannot be empty.")
+
+        y_i64 = y_raw.astype(np.int64, copy=False)
+        if self.__class__ is GeneRoleClassifier:
+            pos_mask = (y_i64 >= 0) & (y_i64 != int(GeneRole.UNKNOWN))
+        else:
+            pos_mask = y_i64 >= 0
+
+        if not np.any(pos_mask):
+            raise ValueError("Training dataset must contain at least one positive class label.")
+
+        y_pos = y_i64[pos_mask]
+        if int(np.min(y_pos)) >= -128 and int(np.max(y_pos)) <= 127:
+            y_arr = y_i64.astype(np.int8)
+            self.classes_ = np.unique(y_pos).astype(np.int8)
+        else:
+            y_arr = y_i64
+            self.classes_ = np.unique(y_pos).astype(np.int64)
+
+        n_classes = len(self.classes_)
+        if n_classes < 2:
+            raise ValueError(f"{self.__class__.__name__} requires at least 2 distinct classes, found {n_classes}.")
+
+        y_indexed = np.full(len(y_arr), -1, dtype=np.int32)
+        y_indexed[pos_mask] = np.searchsorted(self.classes_, y_arr[pos_mask]).astype(np.int32)
+
+        if sample_weight is not None:
+            sw_arr = np.asarray(sample_weight, dtype=np.float32)
+            if len(sw_arr) != len(y_arr):
+                raise ValueError(f"Length of sample_weight ({len(sw_arr)}) does not match y ({len(y_arr)}).")
+            sw_arr = np.maximum(sw_arr, np.float32(0.0))
+            mean_sw = float(np.mean(sw_arr))
+            if mean_sw > 0.0:
+                sw_arr = (sw_arr / np.float32(mean_sw)).astype(np.float32)
+        else:
+            sw_arr = np.ones(len(y_arr), dtype=np.float32)
+
+        if self.class_weight == "balanced":
+            counts = np.bincount(y_indexed[pos_mask], weights=sw_arr[pos_mask], minlength=n_classes).astype(np.float32)
+            counts_safe = np.maximum(counts, 1.0)
+            weights = float(np.sum(sw_arr[pos_mask])) / (float(n_classes) * counts_safe)
+            class_weights = (weights / np.mean(weights)).astype(np.float32)
+        else:
+            class_weights = np.ones(n_classes, dtype=np.float32)
+
+        if y_source is not None:
+            y_src_raw = np.asarray(y_source, dtype=np.int8)
+            if len(y_src_raw) != len(y_arr):
+                raise ValueError(f"Length of y_source ({len(y_src_raw)}) does not match y ({len(y_arr)}).")
+            y_src_arr = np.where((y_src_raw == 0) | (y_src_raw == 1), y_src_raw, np.int8(-1))
+            valid_src = y_src_arr >= 0
+            if np.any(valid_src):
+                src_counts = np.bincount(
+                    y_src_arr[valid_src].astype(np.int32), weights=sw_arr[valid_src], minlength=2
+                ).astype(np.float32)
+                src_safe = np.maximum(src_counts, 1.0)
+                src_w = float(np.sum(sw_arr[valid_src])) / (2.0 * src_safe)
+                src_class_weights = (src_w / np.mean(src_w)).astype(np.float32)
+            else:
+                src_class_weights = np.ones(2, dtype=np.float32)
+        else:
+            y_src_arr = np.full(len(y_arr), -1, dtype=np.int8)
+            src_class_weights = np.ones(2, dtype=np.float32)
+
+        k_tuple = (self.kernel_size,) if isinstance(self.kernel_size, int) else tuple(int(k) for k in self.kernel_size)
+        n_k = len(k_tuple)
+        self.k_sizes_ = np.empty(self.num_filters, dtype=np.int32)
+        base_count = self.num_filters // n_k
+        remainder = self.num_filters % n_k
+        idx = 0
+        for i, k in enumerate(k_tuple):
+            count = base_count + (1 if i < remainder else 0)
+            self.k_sizes_[idx : idx + count] = k
+            idx += count
+
+        self.unique_ks_ = np.unique(self.k_sizes_).astype(np.int32)
+        max_k = int(np.max(self.unique_ks_))
+
+        rng = np.random.default_rng(self.random_state)
+        if (
+            init_from is not None
+            and init_from.is_fitted
+            and init_from.vocab_size == self.vocab_size
+            and init_from.embed_dim == self.embed_dim
+            and init_from.num_filters == self.num_filters
+            and np.array_equal(init_from.k_sizes_, self.k_sizes_)
+        ):
+            self.embedding_ = init_from.embedding_.astype(np.float32, copy=True)
+            self.conv_w_ = init_from.conv_w_.astype(np.float32, copy=True)
+            self.conv_b_ = init_from.conv_b_.astype(np.float32, copy=True)
+        else:
+            self.embedding_ = rng.normal(0, 0.1, (self.vocab_size, self.embed_dim)).astype(np.float32)
+            self.conv_w_ = np.zeros((self.num_filters, self.embed_dim, max_k), dtype=np.float32)
+            for oc in range(self.num_filters):
+                k_width = int(self.k_sizes_[oc])
+                std = float(np.sqrt(2.0 / (self.embed_dim * k_width)))
+                self.conv_w_[oc, :, :k_width] = rng.normal(0.0, std, (self.embed_dim, k_width)).astype(np.float32)
+            self.conv_b_ = np.zeros(self.num_filters, dtype=np.float32)
+
+        feat_dim = 2 * self.num_filters
+        self.dense_w_ = rng.normal(
+            0.0,
+            np.sqrt(2.0 / feat_dim),
+            (feat_dim, n_classes),
+        ).astype(np.float32)
+        self.dense_b_ = np.zeros(n_classes, dtype=np.float32)
+
+        if (
+            init_from is not None
+            and getattr(init_from, "source_w_", None) is not None
+            and len(init_from.source_w_) == feat_dim
+        ):
+            self.source_w_ = init_from.source_w_.astype(np.float32, copy=True)
+            self.source_b_ = init_from.source_b_.astype(np.float32, copy=True)
+        else:
+            self.source_w_ = (
+                rng.normal(0.0, np.sqrt(2.0 / feat_dim), feat_dim).astype(np.float32)
+                if np.any(y_src_arr >= 0)
+                else np.zeros(feat_dim, dtype=np.float32)
+            )
+            self.source_b_ = np.zeros(1, dtype=np.float32)
+
+        x_flat, offsets = self._pack_ragged(X)
+        if len(offsets) - 1 != len(y_arr):
+            raise ValueError(f"Number of samples in X ({len(offsets) - 1}) does not match y ({len(y_arr)}).")
+
+        seed = -1 if self.random_state is None else int(self.random_state)
+
+        (
+            self.embedding_,
+            self.conv_w_,
+            self.conv_b_,
+            self.dense_w_,
+            self.dense_b_,
+            self.source_w_,
+            self.source_b_,
+            loss_hist,
+        ) = _train_adam(
+            x_flat,
+            offsets,
+            y_indexed,
+            class_weights,
+            sw_arr,
+            y_src_arr,
+            src_class_weights,
+            float(source_loss_weight),
+            self.embedding_,
+            self.conv_w_,
+            self.conv_b_,
+            self.dense_w_,
+            self.dense_b_,
+            self.source_w_,
+            self.source_b_,
+            self.k_sizes_,
+            int(self.epochs),
+            int(self.batch_size),
+            float(self.learning_rate),
+            float(self.weight_decay),
+            seed,
+            float(backbone_lr_scale),
+        )
+        self.loss_history_ = [float(x) for x in loss_hist]
+        self.lut_ = _compute_lut(self.embedding_, self.conv_w_, self.k_sizes_)
+        if self.class_weight == "balanced" and n_classes > 1 and len(x_flat) > 0:
+            n_bg = min(len(offsets) - 1, 256)
+            bg_step = max(1, (len(offsets) - 1) // n_bg)
+            bg_offsets = np.zeros(n_bg + 1, dtype=np.int64)
+            for idx_b in range(n_bg):
+                s_i = idx_b * bg_step
+                bg_offsets[idx_b + 1] = bg_offsets[idx_b] + (offsets[s_i + 1] - offsets[s_i])
+            bg_flat = np.empty(int(bg_offsets[-1]), dtype=x_flat.dtype)
+            for idx_b in range(n_bg):
+                s_i = idx_b * bg_step
+                seg = x_flat[offsets[s_i] : offsets[s_i + 1]].copy()
+                rng.shuffle(seg)
+                bg_flat[bg_offsets[idx_b] : bg_offsets[idx_b + 1]] = seg
+            bg_logits = _logits_batch(
+                bg_flat,
+                bg_offsets,
+                self.lut_,
+                self.conv_b_,
+                self.dense_w_,
+                self.dense_b_,
+                self.k_sizes_,
+            )
+            mean_bg = np.mean(bg_logits, axis=0)
+            self.dense_b_ -= np.float32(0.55) * (mean_bg - np.mean(mean_bg))
+        return self
+
+    def transform(
+        self,
+        X: Genes | Sequences | Sequence[Any] | tuple[np.ndarray, np.ndarray],
+        *,
+        layer: str = "penultimate",
+    ) -> np.ndarray[tuple[int, int], np.dtype[np.float32]]:
+        """Extract sequence representations from the specified network layer."""
+        self._check_is_fitted()
+        if layer == "logits":
+            return self.decision_function(X)
+        if layer == "proba":
+            return self.predict_proba(X)
+
+        x_flat, offsets = self._pack_ragged(X)
+        if layer == "embed_mean":
+            return _embed_mean_batch(x_flat, offsets, self.embedding_)
+
+        h = _extract_features_batch(
+            x_flat,
+            offsets,
+            self.lut_,
+            self.conv_b_,
+            self.k_sizes_,
+            self.feature_dim,
+        )
+        nf = self.num_filters
+        if layer in ("penultimate", "full"):
+            return h
+        if layer == "conv_max":
+            return np.ascontiguousarray(h[:, :nf])
+        if layer == "conv_avg":
+            return np.ascontiguousarray(h[:, nf : 2 * nf])
+        if layer == "task_weighted":
+            w_norms = np.maximum(
+                np.linalg.norm(self.dense_w_[: self.feature_dim], axis=1).astype(np.float32), np.float32(1e-6)
+            )
+            return np.ascontiguousarray(h * w_norms[None, :])
+        if layer == "task_weighted_conv_max":
+            w_norms = np.maximum(np.linalg.norm(self.dense_w_[:nf], axis=1).astype(np.float32), np.float32(1e-6))
+            return np.ascontiguousarray(h[:, :nf] * w_norms[None, :])
+        if layer.startswith("conv_k"):
+            try:
+                k_val = int(layer[6:])
+            except ValueError as err:
+                raise ValueError(f"Invalid kernel width in layer={layer!r}.") from err
+            k_mask = np.where(self.k_sizes_ == k_val)[0]
+            if len(k_mask) == 0:
+                raise ValueError(
+                    f"No filters with kernel size {k_val} in model (available: {self.unique_ks_.tolist()})."
+                )
+            idx = np.concatenate([k_mask, nf + k_mask])
+            return np.ascontiguousarray(h[:, idx])
+        raise ValueError(
+            f"Unsupported layer {layer!r}. Expected 'penultimate', 'conv_max', 'conv_avg', "
+            "'task_weighted', 'task_weighted_conv_max', 'embed_mean', 'logits', 'proba', or 'conv_k<N>'."
+        )
+
+    def decision_function(
+        self,
+        X: Genes | Sequences | Sequence[Any] | tuple[np.ndarray, np.ndarray],
+    ) -> np.ndarray[tuple[int, int], np.dtype[np.float32]]:
+        """Compute raw pre-softmax class logits `(n_samples, n_classes)` for each sequence in `X`."""
+        self._check_is_fitted()
+        x_flat, offsets = self._pack_ragged(X)
+        return _logits_batch(
+            x_flat,
+            offsets,
+            self.lut_,
+            self.conv_b_,
+            self.dense_w_,
+            self.dense_b_,
+            self.k_sizes_,
+        )
+
+    def predict_proba(
+        self,
+        X: Genes | Sequences | Sequence[Any] | tuple[np.ndarray, np.ndarray],
+    ) -> np.ndarray[tuple[int, int], np.dtype[np.float32]]:
+        """Predict class probabilities `(n_samples, n_classes)` for each sequence in `X`."""
+        self._check_is_fitted()
+        x_flat, offsets = self._pack_ragged(X)
+        return _forward_batch(
+            x_flat,
+            offsets,
+            self.lut_,
+            self.conv_b_,
+            self.dense_w_,
+            self.dense_b_,
+            self.k_sizes_,
+        )
+
+    def predict_source_proba(
+        self,
+        X: Genes | Sequences | Sequence[Any] | tuple[np.ndarray, np.ndarray],
+    ) -> np.ndarray[tuple[int], np.dtype[np.float32]]:
+        """Predict probability `P(phage | x)` in `[0.0, 1.0]` for each sequence in `X`."""
+        self._check_is_fitted()
+        x_flat, offsets = self._pack_ragged(X)
+        if len(offsets) <= 1:
+            return np.empty(0, dtype=np.float32)
+        h = _extract_features_batch(
+            x_flat,
+            offsets,
+            self.lut_,
+            self.conv_b_,
+            self.k_sizes_,
+            self.feature_dim,
+        )
+        sw = getattr(self, "source_w_", None)
+        sb = getattr(self, "source_b_", None)
+        if sw is None or sb is None or len(sw) != h.shape[1] or not np.any(sw != 0.0):
+            return np.full(h.shape[0], 0.5, dtype=np.float32)
+        logits = np.clip(h @ sw + sb[0], np.float32(-30.0), np.float32(30.0))
+        return (np.float32(1.0) / (np.float32(1.0) + np.exp(-logits))).astype(np.float32)
+
+    def predict_source(
+        self,
+        X: Genes | Sequences | Sequence[Any] | tuple[np.ndarray, np.ndarray],
+        threshold: float = 0.5,
+    ) -> np.ndarray[tuple[int], np.dtype[np.uint8]]:
+        """Predict binary genomic source (`0` = bacterial, `1` = phage/prophage) for each sequence in `X`."""
+        probs = self.predict_source_proba(X)
+        return (probs >= np.float32(threshold)).astype(np.uint8)
+
+    def predict(
+        self,
+        X: Genes | Sequences | Sequence[Any] | tuple[np.ndarray, np.ndarray],
+        min_confidence: float = 0.0,
+        unknown_label: int | None = None,
+    ) -> np.ndarray[tuple[int], np.dtype[Any]]:
+        """Predict most likely class label (e.g. `GeneRole` integer index) for each sequence in `X`."""
+        probs = self.predict_proba(X)
+        out_dtype = self.classes_.dtype
+        if len(probs) == 0:
+            return np.empty(0, dtype=out_dtype)
+        top_indices = np.argmax(probs, axis=1)
+        top_classes = self.classes_[top_indices].astype(out_dtype)
+        if min_confidence > 0.0:
+            unk = (
+                (int(GeneRole.UNKNOWN) if out_dtype == np.int8 else -1) if unknown_label is None else int(unknown_label)
+            )
+            max_probs = np.max(probs, axis=1)
+            return np.where(max_probs >= min_confidence, top_classes, unk).astype(out_dtype)
+        return top_classes
+
+    def score(
+        self,
+        X: Genes | Sequences | Sequence[Any] | tuple[np.ndarray, np.ndarray],
+        y: Sequence[int | GeneRole] | np.ndarray,
+    ) -> float:
+        """Return classification accuracy on `(X, y)`."""
+        preds = self.predict(X)
+        y_arr = np.asarray(y, dtype=self.classes_.dtype)
+        return float(np.mean(preds == y_arr))
+
+    def top_k_accuracy(
+        self,
+        X: Genes | Sequences | Sequence[Any] | tuple[np.ndarray, np.ndarray],
+        y: Sequence[int | GeneRole] | np.ndarray,
+        k: int = 3,
+    ) -> float:
+        """Compute Top-`k` classification accuracy on `(X, y)`."""
+        probs = self.predict_proba(X)
+        y_arr = np.asarray(y, dtype=self.classes_.dtype)
+        if len(y_arr) == 0 or len(probs) == 0:
+            return 0.0
+        k_eff = min(max(1, int(k)), self.num_classes)
+        top_k_idx = np.argsort(-probs, axis=1)[:, :k_eff]
+        top_k_classes = self.classes_[top_k_idx]
+        hits = np.any(top_k_classes == y_arr[:, None], axis=1)
+        return float(np.mean(hits))
+
+    def _check_is_fitted(self) -> None:
+        """Verify that all required model parameters are fitted."""
+        if not self.is_fitted:
+            raise RuntimeError(
+                f"This {self.__class__.__name__} instance is not fitted yet. "
+                "Call 'fit' or load pre-trained weights first."
+            )
+        if getattr(self, "lut_", None) is None:
+            self.lut_ = _compute_lut(self.embedding_, self.conv_w_, self.k_sizes_)
+
+    def save(self, path: Path | str) -> None:
+        """Save model weights, classes, and hyperparameters to a compressed `.npz` archive."""
+        self._check_is_fitted()
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+
+        cw_flag = 1 if self.class_weight == "balanced" else 0
+        first_k = int(self.k_sizes_[0])
+        meta = np.array(
+            [
+                self.vocab_size,
+                self.embed_dim,
+                self.num_filters,
+                first_k,
+                self.batch_size,
+                self.epochs,
+                cw_flag,
+            ],
+            dtype=np.int64,
+        )
+        float_meta = np.array(
+            [
+                self.learning_rate,
+                self.weight_decay,
+                -1.0 if self.random_state is None else float(self.random_state),
+            ],
+            dtype=np.float64,
+        )
+        sw = getattr(self, "source_w_", np.zeros(self.feature_dim, dtype=np.float32))
+        sb = getattr(self, "source_b_", np.zeros(1, dtype=np.float32))
+        np.savez_compressed(
+            p,
+            meta=meta,
+            float_meta=float_meta,
+            classes=self.classes_,
+            embedding=self.embedding_,
+            conv_w=self.conv_w_,
+            conv_b=self.conv_b_,
+            dense_w=self.dense_w_,
+            dense_b=self.dense_b_,
+            source_w=sw,
+            source_b=sb,
+            k_sizes=self.k_sizes_,
+            loss_history=np.array(getattr(self, "loss_history_", []), dtype=np.float32),
+        )
+
+    @classmethod
+    def load(cls, path: Path | str) -> Self:
+        """Load model weights, classes, and hyperparameters from a compressed `.npz` archive."""
+        p = Path(path)
+        if not p.suffix:
+            p = p.with_suffix(".npz")
+
+        with np.load(p) as data:
+            meta = data["meta"]
+            float_meta = data["float_meta"]
+            rs = None if float_meta[2] < 0 else int(float_meta[2])
+            cw = "balanced" if (len(meta) > 6 and meta[6] == 1) else None
+
+            num_filters = int(meta[2])
+            if "k_sizes" in data:
+                k_sizes = data["k_sizes"].astype(np.int32)
+                ordered_ks = tuple(dict.fromkeys(int(x) for x in k_sizes))
+                ks_param: int | tuple[int, ...] = ordered_ks[0] if len(ordered_ks) == 1 else ordered_ks
+            else:
+                ks_param = int(meta[3])
+                k_sizes = np.full(num_filters, ks_param, dtype=np.int32)
+
+            inst = cls(
+                vocab_size=int(meta[0]),
+                embed_dim=int(meta[1]),
+                num_filters=num_filters,
+                kernel_size=ks_param,
+                batch_size=int(meta[4]),
+                epochs=int(meta[5]),
+                learning_rate=float(float_meta[0]),
+                weight_decay=float(float_meta[1]),
+                random_state=rs,
+                class_weight=cw,
+            )
+            raw_classes = data["classes"]
+            if (
+                len(raw_classes) > 0
+                and int(np.min(raw_classes)) >= -128
+                and int(np.max(raw_classes)) <= 127
+                and raw_classes.dtype == np.int8
+            ):
+                inst.classes_ = raw_classes.astype(np.int8)
+            else:
+                inst.classes_ = raw_classes.astype(np.int64)
+            inst.embedding_ = data["embedding"].astype(np.float32)
+            inst.conv_w_ = data["conv_w"].astype(np.float32)
+            inst.conv_b_ = data["conv_b"].astype(np.float32)
+            inst.dense_w_ = data["dense_w"].astype(np.float32)
+            inst.dense_b_ = data["dense_b"].astype(np.float32)
+            f_dim = int(inst.dense_w_.shape[0])
+            inst.source_w_ = (
+                data["source_w"].astype(np.float32) if "source_w" in data else np.zeros(f_dim, dtype=np.float32)
+            )
+            inst.source_b_ = (
+                data["source_b"].astype(np.float32) if "source_b" in data else np.zeros(1, dtype=np.float32)
+            )
+            inst.k_sizes_ = k_sizes
+            inst.unique_ks_ = np.unique(k_sizes).astype(np.int32)
+            inst.loss_history_ = [float(x) for x in data["loss_history"].tolist()]
+            inst.lut_ = _compute_lut(inst.embedding_, inst.conv_w_, inst.k_sizes_)
+            return inst
+
+    @classmethod
+    @cache
+    def pretrained(cls) -> Self:
+        """Load the packaged pre-trained `GeneRoleClassifier` from `serogen.data/model.npz`."""
+        resource = files("seroref.data").joinpath("model.npz")
+        with as_file(resource) as model_path:
+            return cls.load(model_path)
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# High-Performance Numba Kernels
+# ----------------------------------------------------------------------------------------------------------------------
+@njit(cache=True, nogil=True, fastmath=True)
+def _compute_lut(embedding: np.ndarray, conv_w: np.ndarray, k_sizes: np.ndarray) -> np.ndarray:
+    """Precompute token-position-channel lookup table: `(vocab_size, max_k, out_channels)`."""
+    vocab_size, _ = embedding.shape
+    out_channels, in_channels, max_k = conv_w.shape
+    lut = np.zeros((vocab_size, max_k, out_channels), dtype=np.float32)
+    for oc in range(out_channels):
+        k_width = k_sizes[oc]
+        for k in range(k_width):
+            for t in range(vocab_size):
+                s = np.float32(0.0)
+                for ic in range(in_channels):
+                    s += embedding[t, ic] * conv_w[oc, ic, k]
+                lut[t, k, oc] = s
+    return lut
+
+
+@njit(cache=True, nogil=True, inline="always", fastmath=True)
+def _conv_pos_1d(
+    sequences_flat: np.ndarray,
+    abs_pos: int,
+    max_valid_k: int,
+    vocab_size: int,
+    out_channels: int,
+    lut: np.ndarray,
+    conv_b: np.ndarray,
+    val: np.ndarray,
+) -> None:
+    """Accumulate 1D-CNN filter activations at `abs_pos` into `val`."""
+    for oc in range(out_channels):
+        val[oc] = conv_b[oc]
+
+    for k in range(max_valid_k):
+        tok = int(sequences_flat[abs_pos + k])
+        if tok < 0 or tok >= vocab_size:
+            tok = vocab_size - 1
+        for oc in range(out_channels):
+            val[oc] += lut[tok, k, oc]
+
+
+@njit(cache=True, nogil=True, inline="always", fastmath=True)
+def _finalize_features_1d(
+    max_val: np.ndarray,
+    sum_val: np.ndarray,
+    k_sizes: np.ndarray,
+    seq_len: int,
+    out_channels: int,
+    h_out: np.ndarray,
+) -> None:
+    """Populate dual-pooled 1D-CNN features (`[conv_max, conv_avg]`) into `h_out`."""
+    for oc in range(out_channels):
+        k_width = int(k_sizes[oc])
+        if seq_len >= k_width:
+            out_len = seq_len - k_width + 1
+            h_out[oc] = max_val[oc]
+            h_out[out_channels + oc] = sum_val[oc] / np.float32(out_len)
+
+
+@njit(cache=True, nogil=True, parallel=True, fastmath=True)
+def _embed_mean_batch(
+    sequences_flat: np.ndarray,
+    offsets: np.ndarray,
+    embedding: np.ndarray,
+) -> np.ndarray:
+    """Compute length-normalized mean amino-acid embeddings `(n_samples, embed_dim)`."""
+    n_samples = len(offsets) - 1
+    vocab_size, embed_dim = embedding.shape
+    out = np.zeros((n_samples, embed_dim), dtype=np.float32)
+    for i in prange(n_samples):
+        start = int(offsets[i])
+        end = int(offsets[i + 1])
+        seq_len = end - start
+        if seq_len <= 0:
+            continue
+        inv_len = np.float32(1.0 / float(seq_len))
+        for pos in range(start, end):
+            tok = int(sequences_flat[pos])
+            if tok < 0 or tok >= vocab_size:
+                tok = vocab_size - 1
+            for ic in range(embed_dim):
+                out[i, ic] += embedding[tok, ic] * inv_len
+    return out
+
+
+@njit(cache=True, nogil=True, inline="always", fastmath=True)
+def _linear_logits_1d(
+    h: np.ndarray,
+    dense_w: np.ndarray,
+    dense_b: np.ndarray,
+    logits_out: np.ndarray,
+) -> np.float32:
+    """Project feature vector `h` into `logits_out` and return `max(logits_out)`."""
+    feat_dim, n_classes = dense_w.shape
+    max_logit = np.float32(-1e30)
+    for c in range(n_classes):
+        s = dense_b[c]
+        for j in range(feat_dim):
+            s += h[j] * dense_w[j, c]
+        logits_out[c] = s
+        if s > max_logit:
+            max_logit = s
+    return max_logit
+
+
+@njit(cache=True, nogil=True, inline="always", fastmath=True)
+def _softmax_1d(
+    logits: np.ndarray,
+    max_logit: np.float32,
+    probs_out: np.ndarray,
+) -> None:
+    """Compute numerically stable softmax probabilities from `logits` into `probs_out`."""
+    n_classes = len(logits)
+    exp_sum = np.float32(0.0)
+    for c in range(n_classes):
+        e = np.exp(logits[c] - max_logit)
+        probs_out[c] = e
+        exp_sum += e
+
+    inv_sum = np.float32(1.0) / exp_sum
+    for c in range(n_classes):
+        probs_out[c] *= inv_sum
+
+
+@njit(cache=True, nogil=True, parallel=True, fastmath=True)
+def _extract_features_batch(
+    sequences_flat: np.ndarray,
+    offsets: np.ndarray,
+    lut: np.ndarray,
+    conv_b: np.ndarray,
+    k_sizes: np.ndarray,
+    feat_dim: int,
+) -> np.ndarray:
+    """Extract penultimate 1D-CNN dual-pooling features `(n_samples, feat_dim)`."""
+    n_samples = len(offsets) - 1
+    vocab_size, max_k, out_channels = lut.shape
+    features_out = np.zeros((n_samples, feat_dim), dtype=np.float32)
+
+    for i in prange(n_samples):
+        start = int(offsets[i])
+        end = int(offsets[i + 1])
+        seq_len = end - start
+
+        max_val = np.zeros(out_channels, dtype=np.float32)
+        sum_val = np.zeros(out_channels, dtype=np.float32)
+        val = np.empty(out_channels, dtype=np.float32)
+
+        for pos in range(seq_len):
+            rem = seq_len - pos
+            max_valid_k = max_k if rem >= max_k else rem
+            _conv_pos_1d(
+                sequences_flat,
+                start + pos,
+                max_valid_k,
+                vocab_size,
+                out_channels,
+                lut,
+                conv_b,
+                val,
+            )
+            for oc in range(out_channels):
+                if k_sizes[oc] <= rem:
+                    v = val[oc]
+                    if v > np.float32(0.0):
+                        sum_val[oc] += v
+                        if v > max_val[oc]:
+                            max_val[oc] = v
+
+        _finalize_features_1d(
+            max_val,
+            sum_val,
+            k_sizes,
+            seq_len,
+            out_channels,
+            features_out[i],
+        )
+
+    return features_out
+
+
+@njit(cache=True, nogil=True, parallel=True, fastmath=True)
+def _logits_batch(
+    sequences_flat: np.ndarray,
+    offsets: np.ndarray,
+    lut: np.ndarray,
+    conv_b: np.ndarray,
+    dense_w: np.ndarray,
+    dense_b: np.ndarray,
+    k_sizes: np.ndarray,
+) -> np.ndarray:
+    """Compute pre-softmax logits in parallel via `_extract_features_batch` and linear readout."""
+    feat_dim, n_classes = dense_w.shape
+    h = _extract_features_batch(sequences_flat, offsets, lut, conv_b, k_sizes, feat_dim)
+    n_samples = h.shape[0]
+    logits_out = np.empty((n_samples, n_classes), dtype=np.float32)
+
+    for i in prange(n_samples):
+        _linear_logits_1d(h[i], dense_w, dense_b, logits_out[i])
+
+    return logits_out
+
+
+@njit(cache=True, nogil=True, parallel=True, fastmath=True)
+def _forward_batch(
+    sequences_flat: np.ndarray,
+    offsets: np.ndarray,
+    lut: np.ndarray,
+    conv_b: np.ndarray,
+    dense_w: np.ndarray,
+    dense_b: np.ndarray,
+    k_sizes: np.ndarray,
+) -> np.ndarray:
+    """Parallel forward inference kernel returning numerically stable softmax probabilities."""
+    probs = _logits_batch(sequences_flat, offsets, lut, conv_b, dense_w, dense_b, k_sizes)
+    n_samples, n_classes = probs.shape
+
+    for i in prange(n_samples):
+        max_logit = np.float32(-1e30)
+        for c in range(n_classes):
+            if probs[i, c] > max_logit:
+                max_logit = probs[i, c]
+        _softmax_1d(probs[i], max_logit, probs[i])
+
+    return probs
+
+
+@njit(cache=True, nogil=True, parallel=True, fastmath=True)
+def _train_adam(
+    sequences_flat: np.ndarray,
+    offsets: np.ndarray,
+    y_indexed: np.ndarray,
+    class_weights: np.ndarray,
+    sample_weights: np.ndarray,
+    y_source: np.ndarray,
+    src_class_weights: np.ndarray,
+    source_loss_weight: float,
+    embedding: np.ndarray,
+    conv_w: np.ndarray,
+    conv_b: np.ndarray,
+    dense_w: np.ndarray,
+    dense_b: np.ndarray,
+    source_w: np.ndarray,
+    source_b: np.ndarray,
+    k_sizes: np.ndarray,
+    epochs: int,
+    batch_size: int,
+    learning_rate: float,
+    weight_decay: float,
+    seed: int,
+    backbone_lr_scale: float = 1.0,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Parallel mini-batch AdamW training kernel with cosine annealing LR and joint 1-bit source head."""
+    if seed >= 0:
+        np.random.seed(seed)
+
+    n_samples = len(offsets) - 1
+    out_channels, in_channels, max_k = conv_w.shape
+    feat_dim = dense_w.shape[0]
+    n_classes = len(dense_b)
+    vocab_size, embed_dim = embedding.shape
+
+    has_source = False
+    for i_s in range(len(y_source)):
+        if y_source[i_s] >= 0:
+            has_source = True
+            break
+
+    m_emb = np.zeros_like(embedding)
+    v_emb = np.zeros_like(embedding)
+    m_cw = np.zeros_like(conv_w)
+    v_cw = np.zeros_like(conv_w)
+    m_cb = np.zeros_like(conv_b)
+    v_cb = np.zeros_like(conv_b)
+    m_dw = np.zeros_like(dense_w)
+    v_dw = np.zeros_like(dense_w)
+    m_db = np.zeros_like(dense_b)
+    v_db = np.zeros_like(dense_b)
+    m_sw = np.zeros_like(source_w)
+    v_sw = np.zeros_like(source_w)
+    m_sb = np.zeros_like(source_b)
+    v_sb = np.zeros_like(source_b)
+
+    eff_bs = max(1, min(batch_size, n_samples))
+    grad_lut_batch = np.zeros((eff_bs, out_channels, max_k, vocab_size), dtype=np.float32)
+    grad_lut = np.zeros((out_channels, max_k, vocab_size), dtype=np.float32)
+    grad_cb_batch = np.zeros((eff_bs, out_channels), dtype=np.float32)
+    grad_dw_batch = np.zeros((eff_bs, feat_dim, n_classes), dtype=np.float32)
+    grad_db_batch = np.zeros((eff_bs, n_classes), dtype=np.float32)
+    grad_sw_batch = np.zeros((eff_bs, feat_dim), dtype=np.float32)
+    grad_sb_batch = np.zeros(eff_bs, dtype=np.float32)
+    sample_losses = np.zeros(eff_bs, dtype=np.float32)
+
+    loss_history = np.empty(epochs, dtype=np.float32)
+    step = 0
+    lut = _compute_lut(embedding, conv_w, k_sizes)
+    indices = np.arange(n_samples, dtype=np.int32)
+    inv_n_classes = np.float32(1.0 / float(max(n_classes, 1)))
+    src_lw = np.float32(source_loss_weight)
+
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        np.random.shuffle(indices)
+
+        cos_decay = 0.5 * (1.0 + np.cos(np.pi * float(epoch) / float(max(epochs, 1))))
+        lr_epoch = np.float32(learning_rate * (0.05 + 0.95 * cos_decay))
+
+        for b_start in range(0, n_samples, eff_bs):
+            b_end = min(b_start + eff_bs, n_samples)
+            curr_bs = b_end - b_start
+
+            for b in prange(curr_bs):
+                grad_lut_batch[b].fill(0.0)
+                grad_cb_batch[b].fill(0.0)
+                grad_dw_batch[b].fill(0.0)
+                grad_db_batch[b].fill(0.0)
+                grad_sw_batch[b].fill(0.0)
+                grad_sb_batch[b] = np.float32(0.0)
+
+                i = indices[b_start + b]
+                start = int(offsets[i])
+                end = int(offsets[i + 1])
+                seq_len = end - start
+
+                h = np.zeros(feat_dim, dtype=np.float32)
+                max_val = np.zeros(out_channels, dtype=np.float32)
+                sum_val = np.zeros(out_channels, dtype=np.float32)
+                argmax_pos = np.full(out_channels, -1, dtype=np.int32)
+                val = np.empty(out_channels, dtype=np.float32)
+                active_mask = np.zeros((seq_len, out_channels), dtype=np.uint8)
+
+                for pos in range(seq_len):
+                    rem = seq_len - pos
+                    max_valid_k = max_k if rem >= max_k else rem
+                    _conv_pos_1d(
+                        sequences_flat,
+                        start + pos,
+                        max_valid_k,
+                        vocab_size,
+                        out_channels,
+                        lut,
+                        conv_b,
+                        val,
+                    )
+                    for oc in range(out_channels):
+                        if k_sizes[oc] <= rem:
+                            v = val[oc]
+                            if v > np.float32(0.0):
+                                active_mask[pos, oc] = 1
+                                sum_val[oc] += v
+                                if v > max_val[oc]:
+                                    max_val[oc] = v
+                                    argmax_pos[oc] = pos
+
+                _finalize_features_1d(
+                    max_val,
+                    sum_val,
+                    k_sizes,
+                    seq_len,
+                    out_channels,
+                    h,
+                )
+
+                logits = np.empty(n_classes, dtype=np.float32)
+                max_logit = _linear_logits_1d(h, dense_w, dense_b, logits)
+                probs = np.empty(n_classes, dtype=np.float32)
+                _softmax_1d(logits, max_logit, probs)
+
+                target = int(y_indexed[i])
+                d_h = np.zeros(feat_dim, dtype=np.float32)
+                s_loss = np.float32(0.0)
+
+                if target >= 0:
+                    w = class_weights[target] * sample_weights[i]
+                    s_loss += -w * np.log(probs[target] + np.float32(1e-10))
+                    for c in range(n_classes):
+                        d_logit = w * (probs[c] - (np.float32(1.0) if c == target else np.float32(0.0)))
+                        grad_db_batch[b, c] += d_logit
+                        for j in range(feat_dim):
+                            grad_dw_batch[b, j, c] += h[j] * d_logit
+                            d_h[j] += dense_w[j, c] * d_logit
+                else:
+                    # Negative open-set decoy: KL divergence D_KL(Uniform || P) >= 0 encouraging flat 1/C probabilities
+                    w_neg = sample_weights[i] * np.float32(0.35)
+                    log_inv_c = np.log(inv_n_classes + np.float32(1e-10))
+                    for c in range(n_classes):
+                        s_loss += w_neg * inv_n_classes * (log_inv_c - np.log(probs[c] + np.float32(1e-10)))
+                        d_logit = w_neg * (probs[c] - inv_n_classes)
+                        grad_db_batch[b, c] += d_logit
+                        for j in range(feat_dim):
+                            grad_dw_batch[b, j, c] += h[j] * d_logit
+                            d_h[j] += dense_w[j, c] * d_logit
+
+                src_target = int(y_source[i])
+                if has_source and (src_target == 0 or src_target == 1):
+                    src_logit = source_b[0]
+                    for j in range(feat_dim):
+                        src_logit += h[j] * source_w[j]
+                    if src_logit >= np.float32(0.0):
+                        p_src = np.float32(1.0) / (np.float32(1.0) + np.exp(-src_logit))
+                    else:
+                        e_s = np.exp(src_logit)
+                        p_src = e_s / (np.float32(1.0) + e_s)
+                    w_src = src_class_weights[src_target] * sample_weights[i] * src_lw
+                    p_true_src = p_src if src_target == 1 else (np.float32(1.0) - p_src)
+                    s_loss += -w_src * np.log(p_true_src + np.float32(1e-10))
+                    d_src = w_src * (p_src - np.float32(src_target))
+                    grad_sb_batch[b] += d_src
+                    for j in range(feat_dim):
+                        grad_sw_batch[b, j] += h[j] * d_src
+                        d_h[j] += source_w[j] * d_src
+
+                sample_losses[b] = s_loss
+
+                for oc in range(out_channels):
+                    k_width = int(k_sizes[oc])
+                    if seq_len < k_width:
+                        continue
+                    out_len = seq_len - k_width + 1
+                    d_avg_step = d_h[out_channels + oc] / np.float32(out_len)
+                    d_max_oc = d_h[oc]
+                    max_p = int(argmax_pos[oc])
+
+                    for pos in range(out_len):
+                        d_val = np.float32(0.0)
+                        if active_mask[pos, oc] != 0:
+                            d_val += d_avg_step
+                        if pos == max_p and h[oc] > np.float32(0.0):
+                            d_val += d_max_oc
+
+                        if d_val != np.float32(0.0):
+                            grad_cb_batch[b, oc] += d_val
+                            for k in range(k_width):
+                                tok = int(sequences_flat[start + pos + k])
+                                if tok < 0 or tok >= vocab_size:
+                                    tok = vocab_size - 1
+                                grad_lut_batch[b, oc, k, tok] += d_val
+
+            for b in range(curr_bs):
+                epoch_loss += float(sample_losses[b])
+
+            step += 1
+            inv_bc = np.float32(1.0 / curr_bs)
+            beta1 = np.float32(0.9)
+            beta2 = np.float32(0.999)
+            eps = np.float32(1e-8)
+            bc1 = np.float32(1.0 - (0.9**step))
+            bc2 = np.float32(1.0 - (0.999**step))
+            step_size = lr_epoch * np.sqrt(bc2) / bc1
+            wd_factor = np.float32(1.0) - lr_epoch * np.float32(weight_decay)
+            bb_lr_scale = np.float32(backbone_lr_scale)
+            bb_step_size = step_size * bb_lr_scale
+            bb_wd_factor = np.float32(1.0) - lr_epoch * bb_lr_scale * np.float32(weight_decay)
+
+            for c in range(n_classes):
+                g_sum = np.float32(0.0)
+                for b in range(curr_bs):
+                    g_sum += grad_db_batch[b, c]
+                g = g_sum * inv_bc
+                m_db[c] = beta1 * m_db[c] + (np.float32(1.0) - beta1) * g
+                v_db[c] = beta2 * v_db[c] + (np.float32(1.0) - beta2) * g * g
+                dense_b[c] -= step_size * m_db[c] / (np.sqrt(v_db[c]) + eps)
+
+            avg_wd_factor = np.float32(1.0) - lr_epoch * np.float32(weight_decay * 2.0)
+            avg_step_size = step_size * np.float32(0.65)
+            for j in prange(feat_dim):
+                if j < out_channels:
+                    eff_wd, eff_step = wd_factor, step_size
+                else:
+                    eff_wd, eff_step = avg_wd_factor, avg_step_size
+                for c in range(n_classes):
+                    g_sum = np.float32(0.0)
+                    for b in range(curr_bs):
+                        g_sum += grad_dw_batch[b, j, c]
+                    g = g_sum * inv_bc
+                    m_dw[j, c] = beta1 * m_dw[j, c] + (np.float32(1.0) - beta1) * g
+                    v_dw[j, c] = beta2 * v_dw[j, c] + (np.float32(1.0) - beta2) * g * g
+                    dense_w[j, c] = dense_w[j, c] * eff_wd - eff_step * m_dw[j, c] / (np.sqrt(v_dw[j, c]) + eps)
+
+            if has_source:
+                g_sb_sum = np.float32(0.0)
+                for b in range(curr_bs):
+                    g_sb_sum += grad_sb_batch[b]
+                g_sb = g_sb_sum * inv_bc
+                m_sb[0] = beta1 * m_sb[0] + (np.float32(1.0) - beta1) * g_sb
+                v_sb[0] = beta2 * v_sb[0] + (np.float32(1.0) - beta2) * g_sb * g_sb
+                source_b[0] -= step_size * m_sb[0] / (np.sqrt(v_sb[0]) + eps)
+
+                for j in prange(feat_dim):
+                    eff_wd = wd_factor if j < out_channels else avg_wd_factor
+                    eff_step = step_size if j < out_channels else avg_step_size
+                    g_sw_sum = np.float32(0.0)
+                    for b in range(curr_bs):
+                        g_sw_sum += grad_sw_batch[b, j]
+                    g_sw = g_sw_sum * inv_bc
+                    m_sw[j] = beta1 * m_sw[j] + (np.float32(1.0) - beta1) * g_sw
+                    v_sw[j] = beta2 * v_sw[j] + (np.float32(1.0) - beta2) * g_sw * g_sw
+                    source_w[j] = source_w[j] * eff_wd - eff_step * m_sw[j] / (np.sqrt(v_sw[j]) + eps)
+
+            if bb_lr_scale > np.float32(0.0):
+                for oc in prange(out_channels):
+                    g_cb_sum = np.float32(0.0)
+                    for b in range(curr_bs):
+                        g_cb_sum += grad_cb_batch[b, oc]
+                    g_cb = g_cb_sum * inv_bc
+                    m_cb[oc] = beta1 * m_cb[oc] + (np.float32(1.0) - beta1) * g_cb
+                    v_cb[oc] = beta2 * v_cb[oc] + (np.float32(1.0) - beta2) * g_cb * g_cb
+                    conv_b[oc] -= bb_step_size * m_cb[oc] / (np.sqrt(v_cb[oc]) + eps)
+
+                    k_width = int(k_sizes[oc])
+                    for k in range(k_width):
+                        for tok in range(vocab_size):
+                            s_lut = np.float32(0.0)
+                            for b in range(curr_bs):
+                                s_lut += grad_lut_batch[b, oc, k, tok]
+                            grad_lut[oc, k, tok] = s_lut
+
+                # Contract grad_lut with current embedding and conv_w before modifying embedding in-place
+                grad_emb_cur = np.zeros((vocab_size, embed_dim), dtype=np.float32)
+                tok_active_arr = np.zeros(vocab_size, dtype=np.uint8)
+                for tok in range(vocab_size):
+                    is_act = np.uint8(0)
+                    for oc in range(out_channels):
+                        k_width = int(k_sizes[oc])
+                        for k in range(k_width):
+                            gl = grad_lut[oc, k, tok]
+                            if gl != np.float32(0.0):
+                                is_act = np.uint8(1)
+                                for ic in range(embed_dim):
+                                    grad_emb_cur[tok, ic] += gl * conv_w[oc, ic, k]
+                    tok_active_arr[tok] = is_act
+
+                for oc in prange(out_channels):
+                    k_width = int(k_sizes[oc])
+                    for ic in range(in_channels):
+                        for k in range(k_width):
+                            g_sum = np.float32(0.0)
+                            for tok in range(vocab_size):
+                                g_sum += grad_lut[oc, k, tok] * embedding[tok, ic]
+                            g = g_sum * inv_bc
+                            m_cw[oc, ic, k] = beta1 * m_cw[oc, ic, k] + (np.float32(1.0) - beta1) * g
+                            v_cw[oc, ic, k] = beta2 * v_cw[oc, ic, k] + (np.float32(1.0) - beta2) * g * g
+                            conv_w[oc, ic, k] = conv_w[oc, ic, k] * bb_wd_factor - bb_step_size * m_cw[oc, ic, k] / (
+                                np.sqrt(v_cw[oc, ic, k]) + eps
+                            )
+
+                for tok in range(vocab_size):
+                    tok_active = tok_active_arr[tok] != 0
+                    for ic in range(embed_dim):
+                        g = grad_emb_cur[tok, ic] * inv_bc
+                        m_emb[tok, ic] = beta1 * m_emb[tok, ic] + (np.float32(1.0) - beta1) * g
+                        v_emb[tok, ic] = beta2 * v_emb[tok, ic] + (np.float32(1.0) - beta2) * g * g
+                    for ic in range(embed_dim):
+                        if tok_active:
+                            embedding[tok, ic] *= bb_wd_factor
+                        embedding[tok, ic] -= bb_step_size * m_emb[tok, ic] / (np.sqrt(v_emb[tok, ic]) + eps)
+
+                lut = _compute_lut(embedding, conv_w, k_sizes)
+
+        loss_history[epoch] = epoch_loss / n_samples
+
+    return embedding, conv_w, conv_b, dense_w, dense_b, source_w, source_b, loss_history
