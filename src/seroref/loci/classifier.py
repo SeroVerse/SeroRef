@@ -4,10 +4,10 @@ from collections.abc import Sequence
 from typing import Any, Self
 
 import numpy as np
-from scipy.optimize import minimize
+from numba import njit
 
 from seroref.genes.roles import GeneRole
-from seroref.loci.archetypes import ArchetypeTensors, LocusArchetype, get_archetype_tensors
+from seroref.loci.archetypes import ArchetypeSpecs, LocusArchetype
 from seroref.loci.models import Loci, Locus
 
 ArchetypeInput = (
@@ -15,11 +15,118 @@ ArchetypeInput = (
 )
 
 
+@njit(cache=True, nogil=True)
+def _fit_archetype_weights_newton_kernel(
+    comps: np.ndarray,
+    incomps: np.ndarray,
+    pos_scores: np.ndarray,
+    y_arr: np.ndarray,
+    priors: np.ndarray,
+    lo: np.ndarray,
+    hi: np.ndarray,
+    unk_idx: int,
+) -> np.ndarray:
+    """Second-order projected Newton-Raphson solver for the 4D convex softmax + L2 archetype calibration objective."""
+    n, n_arch = comps.shape
+    params = priors.copy()
+    inv_n = 1.0 / float(n)
+
+    for _ in range(25):
+        wc, wi, wl, ul = params[0], params[1], params[2], params[3]
+        grad = 2e-3 * (params - priors)
+        hess = np.zeros((4, 4), dtype=np.float64)
+        for d in range(4):
+            hess[d, d] = 2e-3
+
+        for i in range(n):
+            max_l = ul
+            logits = np.empty(n_arch, dtype=np.float64)
+            for k in range(n_arch):
+                if k == unk_idx:
+                    l_k = ul
+                else:
+                    l_k = wc * comps[i, k] - wi * incomps[i, k] + wl * pos_scores[i, k]
+                logits[k] = l_k
+                if l_k > max_l:
+                    max_l = l_k
+
+            sum_exp = 0.0
+            for k in range(n_arch):
+                e_k = np.exp(logits[k] - max_l)
+                logits[k] = e_k
+                sum_exp += e_k
+            inv_sum = 1.0 / sum_exp
+
+            fp0 = 0.0
+            fp1 = 0.0
+            fp2 = 0.0
+            fp3 = logits[unk_idx] * inv_sum
+            yi = y_arr[i]
+
+            for k in range(n_arch):
+                p_k = logits[k] * inv_sum
+                diff_k = p_k - (1.0 if k == yi else 0.0)
+                if k == unk_idx:
+                    grad[3] += diff_k * inv_n
+                    hess[3, 3] += p_k * inv_n
+                else:
+                    f0 = comps[i, k]
+                    f1 = -incomps[i, k]
+                    f2 = pos_scores[i, k]
+                    grad[0] += diff_k * f0 * inv_n
+                    grad[1] += diff_k * f1 * inv_n
+                    grad[2] += diff_k * f2 * inv_n
+                    fp0 += p_k * f0
+                    fp1 += p_k * f1
+                    fp2 += p_k * f2
+                    pw = p_k * inv_n
+                    hess[0, 0] += pw * f0 * f0
+                    hess[0, 1] += pw * f0 * f1
+                    hess[0, 2] += pw * f0 * f2
+                    hess[1, 1] += pw * f1 * f1
+                    hess[1, 2] += pw * f1 * f2
+                    hess[2, 2] += pw * f2 * f2
+
+            fp = np.array([fp0, fp1, fp2, fp3], dtype=np.float64)
+            for a in range(4):
+                for b in range(a, 4):
+                    hess[a, b] -= fp[a] * fp[b] * inv_n
+                    hess[b, a] = hess[a, b]
+
+        max_pg = 0.0
+        for d in range(4):
+            clamped = (params[d] <= lo[d] and grad[d] > 0.0) or (params[d] >= hi[d] and grad[d] < 0.0)
+            if clamped:
+                for k in range(4):
+                    hess[d, k] = 0.0
+                    hess[k, d] = 0.0
+                hess[d, d] = 1.0
+                grad[d] = 0.0
+            else:
+                ag = abs(grad[d])
+                if ag > max_pg:
+                    max_pg = ag
+
+        if max_pg < 1e-9:
+            break
+
+        step = np.linalg.solve(hess, grad)
+        for d in range(4):
+            v = params[d] - step[d]
+            if v < lo[d]:
+                v = lo[d]
+            elif v > hi[d]:
+                v = hi[d]
+            params[d] = v
+
+    return params
+
+
 class ArchetypeClassifier:
     """Scikit-learn compatible classifier and segment scorer for `LocusArchetype`s.
 
     Encapsulates all discrete bitmask evaluations and continuous noisy-OR log-likelihood-ratio
-    (LLR) scoring over [`ArchetypeTensors`][seroref.loci.archetypes.ArchetypeTensors]. Works out-of-the-box
+    (LLR) scoring over [`ArchetypeSpecs`][seroref.loci.archetypes.ArchetypeSpecs]. Works out-of-the-box
     with domain-calibrated weights (`w_comp`, `w_incomp`, `w_llr`, `unknown_logit`), and optionally
     supports empirical weight calibration via `.fit(X, y)` on labeled loci.
     """
@@ -32,7 +139,7 @@ class ArchetypeClassifier:
         w_incomp: float = 15.0,
         w_llr: float = 0.15,
         unknown_logit: float = 4.5,
-        tensors: ArchetypeTensors | None = None,
+        specs: ArchetypeSpecs | None = None,
     ) -> None:
         self.min_completeness = min_completeness
         self.max_incompatibility = max_incompatibility
@@ -40,7 +147,7 @@ class ArchetypeClassifier:
         self.w_incomp = w_incomp
         self.w_llr = w_llr
         self.unknown_logit = unknown_logit
-        self.tensors = tensors if tensors is not None else get_archetype_tensors()
+        self.specs = specs if specs is not None else LocusArchetype.specs()
 
     @property
     def classes_(self) -> np.ndarray[tuple[int], np.dtype[np.int32]]:
@@ -62,13 +169,13 @@ class ArchetypeClassifier:
     def check_modules(self, mask: int) -> np.ndarray[tuple[int], np.dtype[np.int32]]:
         """Count how many required functional modules are satisfied for each archetype (`(11,)`)."""
         m = np.uint32(mask)
-        satisfied = (self.tensors.module_masks & m) != 0
-        satisfied &= self.tensors.active_module_mask
+        satisfied = (self.specs.module_masks & m) != 0
+        satisfied &= self.specs.active_module_mask
         return np.sum(satisfied, axis=1, dtype=np.int32)
 
     def check_forbidden(self, mask: int) -> np.ndarray[tuple[int], np.dtype[np.bool_]]:
         """Return a boolean array `(11,)` indicating whether any forbidden role is present."""
-        return (self.tensors.forbidden_masks & np.uint32(mask)) != 0
+        return (self.specs.forbidden_masks & np.uint32(mask)) != 0
 
     def is_complete(
         self, mask: int, min_completeness: float | None = None
@@ -77,8 +184,8 @@ class ArchetypeClassifier:
         thresh = self.min_completeness if min_completeness is None else min_completeness
         mod_counts = self.check_modules(mask)
         no_forbidden = ~self.check_forbidden(mask)
-        has_modules = self.tensors.num_modules > 0
-        denom = np.maximum(self.tensors.num_modules, 1)
+        has_modules = self.specs.num_modules > 0
+        denom = np.maximum(self.specs.num_modules, 1)
         completeness = np.where(has_modules, mod_counts / denom, 0.0)
         return has_modules & no_forbidden & (completeness >= thresh)
 
@@ -91,12 +198,12 @@ class ArchetypeClassifier:
         thresh = self.min_completeness if min_completeness is None else min_completeness
         mod_counts = self.check_modules(mask)
         no_forbidden = ~self.check_forbidden(mask)
-        has_modules = self.tensors.num_modules > 0
-        denom = np.maximum(self.tensors.num_modules, 1)
+        has_modules = self.specs.num_modules > 0
+        denom = np.maximum(self.specs.num_modules, 1)
         completeness = np.where(has_modules & no_forbidden, mod_counts / denom, 0.0)
 
         cargo_overlap = np.array(
-            [(int(c_mask) & int(mask)).bit_count() for c_mask in self.tensors.all_relevant_masks],
+            [(int(c_mask) & int(mask)).bit_count() for c_mask in self.specs.all_relevant_masks],
             dtype=np.float64,
         )
         ranking = completeness + 1e-3 * mod_counts + 1e-5 * cargo_overlap
@@ -114,7 +221,7 @@ class ArchetypeClassifier:
         if r_idx in (int(GeneRole.TRANSPOSASE), int(GeneRole.INTEGRASE), int(GeneRole.UNKNOWN)):
             return False
         a_idx = int(archetype)
-        return (int(self.tensors.all_relevant_masks[a_idx]) & (1 << r_idx)) != 0
+        return (int(self.specs.all_relevant_masks[a_idx]) & (1 << r_idx)) != 0
 
     # ------------------------------------------------------------------------------------------------------------------
     # Prefix-Sum Vectorized Soft Probability Scoring
@@ -160,7 +267,7 @@ class ArchetypeClassifier:
         np.ndarray[tuple[int, int], np.dtype[np.float64]],
     ]:
         """Precompute $O(L)$ prefix sums of log-complement and log-odds probabilities across a contig."""
-        t = self.tensors
+        t = self.specs
         length = len(probs)
         n_arch, max_mods, _ = t.module_indicators.shape
 
@@ -172,7 +279,7 @@ class ArchetypeClassifier:
         forb_hit = np.clip(forb_probs @ t.forbidden_indicators.T, 0.0, 1.0)
         log_not_forb = np.log(np.clip(1.0 - forb_hit, 1e-12, 1.0))
 
-        null_mass = probs @ t.null_priors
+        null_mass = probs @ GeneRole.specs().null_priors
         rel_mass = probs @ t.relevant_indicators.T
         arch_emission = 0.85 * rel_mass + 0.15 * null_mass[:, None]
         forb_penalty = np.log(np.clip(1.0 - 0.95 * forb_hit, 1e-6, 1.0))
@@ -216,7 +323,7 @@ class ArchetypeClassifier:
                 raise ValueError("Either `probs` or `prefixes` must be provided to `score_segments`.")
             prefixes = self.precompute_prefixes(probs)
 
-        t = self.tensors
+        t = self.specs
         pref_mod, pref_forb, pref_llr = prefixes
         seg_log_not_mod = pref_mod[ends] - pref_mod[starts]
         raw_mod_probs = 1.0 - np.exp(seg_log_not_mod)
@@ -368,31 +475,27 @@ class ArchetypeClassifier:
             self.unknown_logit_ = self.unknown_logit
             return self
 
-        pos_scores = np.maximum(scores, 0.0)
+        pos_scores = np.ascontiguousarray(np.maximum(scores, 0.0), dtype=np.float64)
         unk_idx = int(LocusArchetype.UNKNOWN)
+        priors = np.array([self.w_comp, self.w_incomp, self.w_llr, self.unknown_logit], dtype=np.float64)
+        lo = np.array([1.0, 1.0, 0.01, 0.0], dtype=np.float64)
+        hi = np.array([50.0, 50.0, 5.0, 20.0], dtype=np.float64)
 
-        def _loss(params: np.ndarray) -> float:
-            wc, wi, wl, ul = params
-            logits = wc * comps - wi * incomps + wl * pos_scores
-            logits[:, unk_idx] = ul
-            logits = logits - np.max(logits, axis=1, keepdims=True)
-            log_probs = logits - np.log(np.sum(np.exp(logits), axis=1, keepdims=True))
-            nll = -float(np.mean(log_probs[np.arange(n), y_arr]))
-            reg = 1e-3 * float(
-                (wc - self.w_comp) ** 2
-                + (wi - self.w_incomp) ** 2
-                + (wl - self.w_llr) ** 2
-                + (ul - self.unknown_logit) ** 2
-            )
-            return nll + reg
+        params = _fit_archetype_weights_newton_kernel(
+            np.ascontiguousarray(comps, dtype=np.float64),
+            np.ascontiguousarray(incomps, dtype=np.float64),
+            pos_scores,
+            y_arr,
+            priors,
+            lo,
+            hi,
+            unk_idx,
+        )
 
-        init = np.array([self.w_comp, self.w_incomp, self.w_llr, self.unknown_logit], dtype=np.float64)
-        bounds = [(1.0, 50.0), (1.0, 50.0), (0.01, 5.0), (0.0, 20.0)]
-        res = minimize(_loss, init, method="L-BFGS-B", bounds=bounds)
-        self.w_comp_ = float(res.x[0])
-        self.w_incomp_ = float(res.x[1])
-        self.w_llr_ = float(res.x[2])
-        self.unknown_logit_ = float(res.x[3])
+        self.w_comp_ = float(params[0])
+        self.w_incomp_ = float(params[1])
+        self.w_llr_ = float(params[2])
+        self.unknown_logit_ = float(params[3])
         return self
 
     def score(self, X: ArchetypeInput, y: Sequence[int | LocusArchetype] | np.ndarray) -> float:

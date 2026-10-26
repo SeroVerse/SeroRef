@@ -6,14 +6,14 @@ from enum import IntEnum
 from typing import Any, Self, cast, overload
 
 import numpy as np
-from scipy.sparse import csr_array
-from seroverse.core.graph.models import TAG_EDGE, BitField, DirectedEdge, GraphBatch, GraphModel, IntNode
+from seroverse.core.graph.csr import CSR
+from seroverse.core.graph.models import TAG_EDGE, BitField, DirectedEdge, Graph, Graphs, IntNode
 from seroverse.core.interval import Interval, Intervals, Strand
 from seroverse.core.seq.clustering import Clusterer, Clusters
 
 from seroref.genes.models import Genes
 from seroref.genes.roles import GeneRole
-from seroref.loci.archetypes import ArchetypeCategory, LocusArchetype, get_archetype_tensors, roles_to_mask
+from seroref.loci.archetypes import ArchetypeCategory, LocusArchetype, roles_to_mask
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -204,7 +204,7 @@ class GeneNode(IntNode):
         return GeneNode(cleared | type(self).CLUSTER_ID.pack(int(cluster_id)))
 
     def __repr__(self) -> str:
-        r_abbr = self.role.abbreviation
+        r_abbr = self.role.abbreviation.decode("ascii")
         fs = ",FS" if self.is_frameshift else ""
         ph = ",phage" if self.is_phage else ""
         cid = f",c={self.cluster_id}" if self.cluster_id > 0 else ""
@@ -215,7 +215,7 @@ class GeneNode(IntNode):
 # Scalar Locus Container
 # ----------------------------------------------------------------------------------------------------------------------
 @dataclass(slots=True, frozen=True, eq=False)
-class Locus(GraphModel):
+class Locus(Graph):
     """Scalar view and directed syntenic graph of a single biosynthetic gene cluster.
 
     Embeds its constituent [`Genes`][seroref.genes.models.Genes] container (`self.genes`),
@@ -232,7 +232,7 @@ class Locus(GraphModel):
     completeness: float = 0.0
     score: float = 0.0
     is_tandem_split: bool = False
-    name: str = ""
+    name: bytes = b""
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Locus):
@@ -264,9 +264,9 @@ class Locus(GraphModel):
             )
         )
 
-    def with_name(self, name: str | bytes) -> Locus:
+    def with_name(self, name: bytes | str) -> Locus:
         """Return a copy of this `Locus` with an updated identifier `name`."""
-        name_str = name.decode("utf-8", errors="replace") if isinstance(name, bytes) else str(name)
+        name_b = name.encode("utf-8") if isinstance(name, str) else bytes(name)
         return Locus(
             nodes=self.nodes,
             edges=self.edges,
@@ -277,7 +277,7 @@ class Locus(GraphModel):
             completeness=self.completeness,
             score=self.score,
             is_tandem_split=self.is_tandem_split,
-            name=name_str,
+            name=name_b,
         )
 
     @property
@@ -537,14 +537,15 @@ class Locus(GraphModel):
         score: float = 0.0,
         is_tandem_split: bool = False,
         contig_index: int = 0,
-        name: str = "",
+        name: bytes | str = b"",
     ) -> Self:
         """Construct a `Locus` from either a `Genes` container or a sequence of gene symbols/roles."""
+        name_b = name.encode("utf-8") if isinstance(name, str) else bytes(name)
         if isinstance(genes, Genes):
             genes_obj = genes
             n = len(genes_obj)
             if n == 0:
-                return cls(nodes=(), edges=(), genes=Genes.empty(), archetype=archetype, name=name)
+                return cls(nodes=(), edges=(), genes=Genes.empty(), archetype=archetype, name=name_b)
             if roles is None:
                 role_ids = np.full(n, int(GeneRole.UNKNOWN), dtype=np.int32)
             elif isinstance(roles, np.ndarray) and roles.dtype.kind in ("i", "u"):
@@ -560,7 +561,7 @@ class Locus(GraphModel):
             raw_list = list(genes)
             n = len(raw_list)
             if n == 0:
-                return cls(nodes=(), edges=(), genes=Genes.empty(), archetype=archetype, name=name)
+                return cls(nodes=(), edges=(), genes=Genes.empty(), archetype=archetype, name=name_b)
 
             if roles is not None:
                 role_ids = np.array(
@@ -642,7 +643,7 @@ class Locus(GraphModel):
             completeness=float(completeness),
             score=float(score),
             is_tandem_split=bool(is_tandem_split),
-            name=name,
+            name=name_b,
         )
 
     def match(self, targets: Locus | Loci, **kwargs: Any) -> Any:
@@ -668,7 +669,7 @@ class Locus(GraphModel):
 # Batched Structure-of-Arrays Loci Container
 # ----------------------------------------------------------------------------------------------------------------------
 @dataclass(slots=True, frozen=True)
-class Loci(GraphBatch[Locus, "Loci"]):
+class Loci(Graphs[Locus, "Loci"]):
     """Structure-of-Arrays (SoA) batch container for biosynthetic gene clusters (`Locus`).
 
     Combines `GraphBatch` sparse topology arrays (`node_types`, `node_offsets`, `edge_sources`,
@@ -695,26 +696,30 @@ class Loci(GraphBatch[Locus, "Loci"]):
     is_tandem_split: np.ndarray[tuple[int], np.dtype[np.bool_]] = field(
         default_factory=lambda: np.empty(0, dtype=np.bool_)
     )
-    names: np.ndarray[tuple[int], np.dtype[np.str_]] = field(default_factory=lambda: np.empty(0, dtype="U1"))
+    names: np.ndarray[tuple[int], np.dtype[np.bytes_]] = field(default_factory=lambda: np.empty(0, dtype="S1"))
 
     def __post_init__(self) -> None:
         n = max(0, len(self.node_offsets) - 1)
         if len(self.names) == 0 and n > 0:
-            object.__setattr__(self, "names", np.full(n, "", dtype="U1"))
-        elif self.names.dtype.kind == "S":
-            object.__setattr__(self, "names", np.char.decode(cast(Any, self.names), "utf-8", errors="replace"))
-        elif self.names.dtype.kind != "U":
-            object.__setattr__(self, "names", np.asarray(self.names, dtype=str))
+            object.__setattr__(self, "names", np.full(n, b"", dtype="S1"))
+        elif self.names.dtype.kind == "U":
+            object.__setattr__(self, "names", np.char.encode(cast(Any, self.names), "utf-8"))
+        elif self.names.dtype.kind != "S":
+            object.__setattr__(
+                self,
+                "names",
+                np.array([x.encode("utf-8") if isinstance(x, str) else bytes(x) for x in self.names], dtype="S"),
+            )
 
     def __len__(self) -> int:
         return len(self.node_offsets) - 1
 
-    def with_names(self, names: Sequence[str | bytes] | np.ndarray) -> Self:
+    def with_names(self, names: Sequence[bytes | str] | np.ndarray) -> Self:
         """Return a new `Loci` batch with updated per-locus identifier `names`."""
-        raw = [x.decode("utf-8", errors="replace") if isinstance(x, bytes) else str(x) for x in names]
+        raw = [x.encode("utf-8") if isinstance(x, str) else bytes(x) for x in names]
         if len(raw) != len(self):
             raise ValueError(f"Expected {len(self)} locus names, got {len(raw)}.")
-        names_arr = np.array(raw, dtype=str) if raw else np.empty(0, dtype="U1")
+        names_arr = np.array(raw, dtype="S") if raw else np.empty(0, dtype="S1")
         return type(self)(
             node_types=self.node_types,
             node_offsets=self.node_offsets,
@@ -807,11 +812,11 @@ class Loci(GraphBatch[Locus, "Loci"]):
         return (~self.is_fragmented) & (~self.has_mge) & (self.num_frameshifts == 0)
 
     @property
-    def categories(self) -> np.ndarray[tuple[int], np.dtype[np.str_]]:
-        """1D string array (`(N,)`) of `ArchetypeCategory` values (`'Capsule'`, `'O-Antigen'`, etc.) per locus."""
+    def categories(self) -> np.ndarray[tuple[int], np.dtype[np.int8]]:
+        """1D `int8` array (`(N,)`) of `ArchetypeCategory` IDs (`0..3`) per locus."""
         if len(self) == 0:
-            return np.empty(0, dtype="U20")
-        return get_archetype_tensors().categories[self.archetypes]
+            return np.empty(0, dtype=np.int8)
+        return LocusArchetype.specs().categories[self.archetypes]
 
     def best(self, *, prefer_intact: bool = False) -> Locus | None:
         """Return the highest-scoring `Locus` in the batch (or `None` if empty).
@@ -833,9 +838,14 @@ class Loci(GraphBatch[Locus, "Loci"]):
     def filter(
         self,
         *,
-        names: str | Iterable[str] | None = None,
-        categories: ArchetypeCategory | str | Iterable[ArchetypeCategory | str] | None = None,
-        archetypes: LocusArchetype | str | int | Iterable[LocusArchetype | str | int] | None = None,
+        names: bytes | str | Iterable[bytes | str] | None = None,
+        categories: ArchetypeCategory
+        | bytes
+        | str
+        | int
+        | Iterable[ArchetypeCategory | bytes | str | int]
+        | None = None,
+        archetypes: LocusArchetype | bytes | str | int | Iterable[LocusArchetype | bytes | str | int] | None = None,
         min_completeness: float = 0.0,
         min_score: float = 0.0,
         max_frameshift_fraction: float = 1.0,
@@ -847,8 +857,11 @@ class Loci(GraphBatch[Locus, "Loci"]):
             return self
         mask = np.ones(n, dtype=np.bool_)
         if names is not None:
-            name_items = [names] if isinstance(names, str) else list(names)
-            allowed_names = np.array([str(x) for x in name_items], dtype=str)
+            name_items = [names] if isinstance(names, (str, bytes)) else list(names)
+            allowed_names = np.array(
+                [x.encode("utf-8") if isinstance(x, str) else bytes(x) for x in name_items],
+                dtype="S",
+            )
             mask &= np.isin(self.names, allowed_names)
         if min_completeness > 0.0:
             mask &= self.completeness >= min_completeness
@@ -860,20 +873,14 @@ class Loci(GraphBatch[Locus, "Loci"]):
             mask &= ~self.is_fragmented
             mask &= np.array([not loc.has_mobile_elements for loc in self], dtype=np.bool_)
         if categories is not None:
-            cat_items = [categories] if isinstance(categories, (str, ArchetypeCategory)) else list(categories)
-            allowed_cats = {
-                (c.value if isinstance(c, ArchetypeCategory) else str(c)).strip().lower().replace("_", "-")
-                for c in cat_items
-            }
-            t_cats = np.array(
-                [str(c).strip().lower().replace("_", "-") for c in get_archetype_tensors().categories],
-                dtype="U20",
+            cat_items: list[ArchetypeCategory | bytes | str | int] = (
+                [categories] if isinstance(categories, (str, bytes, int, ArchetypeCategory)) else list(categories)
             )
-            arch_cat_ok = np.array([c in allowed_cats for c in t_cats], dtype=np.bool_)
-            mask &= arch_cat_ok[self.archetypes]
+            allowed_cat_ids = np.array([int(ArchetypeCategory.from_name(c)) for c in cat_items], dtype=np.int8)
+            mask &= np.isin(self.categories, allowed_cat_ids)
         if archetypes is not None:
-            arch_items: list[LocusArchetype | str | int] = (
-                [archetypes] if isinstance(archetypes, (str, int, LocusArchetype)) else list(archetypes)
+            arch_items: list[LocusArchetype | bytes | str | int] = (
+                [archetypes] if isinstance(archetypes, (str, bytes, int, LocusArchetype)) else list(archetypes)
             )
             allowed_arch_ids = np.array([int(LocusArchetype.from_name(a)) for a in arch_items], dtype=np.int8)
             mask &= np.isin(self.archetypes, allowed_arch_ids)
@@ -896,7 +903,7 @@ class Loci(GraphBatch[Locus, "Loci"]):
             completeness=np.empty(0, dtype=np.float32),
             scores=np.empty(0, dtype=np.float32),
             is_tandem_split=np.empty(0, dtype=np.bool_),
-            names=np.empty(0, dtype="U1"),
+            names=np.empty(0, dtype="S1"),
         )
 
     @classmethod
@@ -927,8 +934,9 @@ class Loci(GraphBatch[Locus, "Loci"]):
         )
 
     @classmethod
-    def from_list(cls, loci: Sequence[Locus]) -> Self:
+    def from_list(cls, graphs: Sequence[Any]) -> Self:
         """Compile a sequence of scalar `Locus` objects into a contiguous `Loci` batch."""
+        loci: Sequence[Locus] = graphs
         n_loci = len(loci)
         if n_loci == 0:
             return cls.empty()
@@ -954,7 +962,7 @@ class Loci(GraphBatch[Locus, "Loci"]):
         completeness = np.empty(n_loci, dtype=np.float32)
         scores = np.empty(n_loci, dtype=np.float32)
         is_tandem_split = np.empty(n_loci, dtype=np.bool_)
-        names_list: list[str] = []
+        names_list: list[bytes] = []
         genes_batches: list[Genes] = []
 
         curr_node = 0
@@ -984,7 +992,7 @@ class Loci(GraphBatch[Locus, "Loci"]):
             completeness[i] = loc.completeness
             scores[i] = loc.score
             is_tandem_split[i] = loc.is_tandem_split
-            names_list.append(loc.name)
+            names_list.append(loc.name if isinstance(loc.name, bytes) else str(loc.name).encode("utf-8"))
             genes_batches.append(loc.genes)
 
         return cls(
@@ -1001,7 +1009,7 @@ class Loci(GraphBatch[Locus, "Loci"]):
             completeness=completeness,
             scores=scores,
             is_tandem_split=is_tandem_split,
-            names=np.array(names_list, dtype=str),
+            names=np.array(names_list, dtype="S"),
         )
 
     def canonicalize_strands(self) -> Self:
@@ -1110,7 +1118,7 @@ class Loci(GraphBatch[Locus, "Loci"]):
         cluster_genes: bool = False,
         clusterer: Clusterer | None = None,
     ) -> tuple[
-        csr_array,
+        CSR,
         np.ndarray[tuple[int], np.dtype[np.uint32]],
         np.ndarray[tuple[int], np.dtype[np.uint32]],
     ]:
@@ -1155,21 +1163,22 @@ class Loci(GraphBatch[Locus, "Loci"]):
         return matcher.match(query, top_k=top_k, min_score=min_score, sort=sort)
 
     @overload
-    def __getitem__(self, item: int | np.integer[Any] | str) -> Locus: ...
+    def __getitem__(self, item: int | np.integer[Any] | bytes | str) -> Locus: ...
 
     @overload
     def __getitem__(self, item: slice | np.ndarray[tuple[int], Any] | list[Any]) -> Self: ...
 
     @overload
     def __getitem__(
-        self, item: int | np.integer[Any] | str | slice | np.ndarray[tuple[int], Any] | list[Any]
+        self, item: int | np.integer[Any] | bytes | str | slice | np.ndarray[tuple[int], Any] | list[Any]
     ) -> Locus | Self: ...
 
     def __getitem__(
-        self, item: int | np.integer[Any] | str | slice | np.ndarray[tuple[int], Any] | list[Any]
+        self, item: int | np.integer[Any] | bytes | str | slice | np.ndarray[tuple[int], Any] | list[Any]
     ) -> Locus | Self:
-        if isinstance(item, str):
-            matches = np.nonzero(self.names == item)[0]
+        if isinstance(item, (bytes, str)):
+            key_b = item.encode("utf-8") if isinstance(item, str) else bytes(item)
+            matches = np.nonzero(self.names == key_b)[0]
             if len(matches) == 0:
                 raise KeyError(f"Locus name {item!r} not found in Loci batch.")
             item = int(matches[0])
@@ -1208,7 +1217,7 @@ class Loci(GraphBatch[Locus, "Loci"]):
                 completeness=float(self.completeness[idx]) if len(self.completeness) > idx else 0.0,
                 score=float(self.scores[idx]) if len(self.scores) > idx else 0.0,
                 is_tandem_split=bool(self.is_tandem_split[idx]) if len(self.is_tandem_split) > idx else False,
-                name=str(self.names[idx]) if len(self.names) > idx else "",
+                name=bytes(self.names[idx]) if len(self.names) > idx else b"",
             )
 
         kept_indices = self._normalize_indices(item)

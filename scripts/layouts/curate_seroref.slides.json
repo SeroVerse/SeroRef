@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "type": "slides",
+  "data": {
+    "cells": [
+      {
+        "id": "Hbol",
+        "code_hash": "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d"
+      },
+      {
+        "id": "MJUe",
+        "code_hash": "2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e"
+      },
+      {
+        "id": "vblA",
+        "code_hash": "3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f"
+      },
+      {
+        "id": "bkHC",
+        "code_hash": "4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a"
+      },
+      {
+        "id": "lEQa",
+        "code_hash": "5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b"
+      },
+      {
+        "id": "PKri",
+        "code_hash": "6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c"
+      },
+      {
+        "id": "Xref",
+        "code_hash": "7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d"
+      }
+    ]
+  }
+}

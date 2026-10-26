@@ -110,7 +110,7 @@ class LocusPredictor:
                 raw_probs[unpaired_perm, perm_col] = 1e-12
                 logits[unpaired_perm, perm_col] = -10.0
 
-            mach_set = set(int(r) for r in self.archetype_classifier.tensors.machinery_roles)
+            mach_set = set(int(r) for r in GeneRole.specs().machinery_roles)
             mach_col_mask = np.array([int(c) in mach_set for c in classes], dtype=np.bool_)
             neg_mach_mask = (logits < 1.0) & mach_col_mask[None, :]
             cleaned_probs = np.where(neg_mach_mask, 1e-12, raw_probs)
@@ -138,8 +138,13 @@ class LocusPredictor:
         self,
         target: bytes | str | Sequence | Sequences | GenomeAssembly | Genes,
         *,
-        categories: ArchetypeCategory | str | Iterable[ArchetypeCategory | str] | None = None,
-        archetypes: LocusArchetype | str | int | Iterable[LocusArchetype | str | int] | None = None,
+        categories: ArchetypeCategory
+        | bytes
+        | str
+        | int
+        | Iterable[ArchetypeCategory | bytes | str | int]
+        | None = None,
+        archetypes: LocusArchetype | bytes | str | int | Iterable[LocusArchetype | bytes | str | int] | None = None,
         min_completeness: float = 0.0,
         min_score: float = 0.0,
         max_frameshift_fraction: float = 1.0,

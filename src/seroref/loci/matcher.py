@@ -9,7 +9,7 @@ import numpy as np
 from numba import njit, prange
 from seroverse.core.collections import BatchedContainer, ScalarView
 from seroverse.core.graph.align import Alignment, CostStrategy, GraphAligner
-from seroverse.core.graph.models import GraphModel
+from seroverse.core.graph.models import Graph
 from seroverse.core.seq.clustering import Clusterer
 from seroverse.core.seq.kmers import RandstrobeIndex
 from seroverse.core.seq.pairwise import PairwiseAligner
@@ -86,7 +86,7 @@ class Match(ScalarView):
     missing_genes: int
     extra_genes: int
     mean_aa_identity: float = 1.0
-    target_name: str = ""
+    target_name: bytes = b""
 
     @property
     def is_exact(self) -> bool:
@@ -116,20 +116,18 @@ class Matches(BatchedContainer[Match, "Matches"]):
     mean_aa_identities: np.ndarray[tuple[int], np.dtype[np.float32]] = field(
         default_factory=lambda: np.empty(0, dtype=np.float32)
     )
-    target_names: np.ndarray[tuple[int], np.dtype[np.str_]] = field(default_factory=lambda: np.empty(0, dtype="U1"))
+    target_names: np.ndarray[tuple[int], np.dtype[np.bytes_]] = field(default_factory=lambda: np.empty(0, dtype="S1"))
 
     def __post_init__(self) -> None:
         n = len(self.scores)
         if len(self.mean_aa_identities) == 0 and n > 0:
             object.__setattr__(self, "mean_aa_identities", np.ones(n, dtype=np.float32))
         if len(self.target_names) == 0 and n > 0:
-            object.__setattr__(self, "target_names", np.full(n, "", dtype="U1"))
-        elif self.target_names.dtype.kind == "S":
-            object.__setattr__(
-                self, "target_names", np.char.decode(cast(Any, self.target_names), "utf-8", errors="replace")
-            )
-        elif self.target_names.dtype.kind != "U":
-            object.__setattr__(self, "target_names", np.asarray(self.target_names, dtype=str))
+            object.__setattr__(self, "target_names", np.full(n, b"", dtype="S1"))
+        elif self.target_names.dtype.kind == "U":
+            object.__setattr__(self, "target_names", np.char.encode(cast(Any, self.target_names), "utf-8"))
+        elif self.target_names.dtype.kind != "S":
+            object.__setattr__(self, "target_names", np.asarray(self.target_names, dtype=bytes))
 
     def __len__(self) -> int:
         return len(self.scores)
@@ -157,7 +155,7 @@ class Matches(BatchedContainer[Match, "Matches"]):
             missing_genes=np.empty(0, dtype=np.int32),
             extra_genes=np.empty(0, dtype=np.int32),
             mean_aa_identities=np.empty(0, dtype=np.float32),
-            target_names=np.empty(0, dtype="U1"),
+            target_names=np.empty(0, dtype="S1"),
         )
 
     @classmethod
@@ -215,7 +213,7 @@ class Matches(BatchedContainer[Match, "Matches"]):
                 missing_genes=int(self.missing_genes[idx]),
                 extra_genes=int(self.extra_genes[idx]),
                 mean_aa_identity=float(self.mean_aa_identities[idx]) if len(self.mean_aa_identities) > idx else 1.0,
-                target_name=str(self.target_names[idx]) if len(self.target_names) > idx else "",
+                target_name=bytes(self.target_names[idx]) if len(self.target_names) > idx else b"",
             )
 
         indices = self._normalize_indices(item)
@@ -237,7 +235,7 @@ class Matches(BatchedContainer[Match, "Matches"]):
             else np.ones(len(indices), dtype=np.float32),
             target_names=self.target_names[indices]
             if len(self.target_names) == len(self.scores)
-            else np.full(len(indices), "", dtype="U1"),
+            else np.full(len(indices), b"", dtype="S1"),
         )
 
     def _popcounts(self) -> np.ndarray[tuple[int], np.dtype[np.int32]]:
@@ -772,8 +770,8 @@ class LocusNodeCostStrategy(CostStrategy):
         labels_a: np.ndarray[tuple[int], np.dtype[Any]],
         labels_b: np.ndarray[tuple[int], np.dtype[Any]],
         penalty: float = 1e6,
-        graph_a: GraphModel | None = None,
-        graph_b: GraphModel | None = None,
+        graph_a: Graph | None = None,
+        graph_b: Graph | None = None,
     ) -> np.ndarray[tuple[int, int], np.dtype[np.float64]]:
         if len(labels_a) == 0 or len(labels_b) == 0:
             return np.empty((len(labels_a), len(labels_b)), dtype=np.float64)
@@ -823,7 +821,7 @@ class LocusMatcher:
     """Vectorized 1-to-many and batch-to-many biosynthetic locus matcher.
 
     Indexes a reference database of target [`Loci`][seroref.loci.models.Loci] (automatically clustering
-    target proteins and building a single [`RandstrobeIndex`][seroverse.core.seq.kmers.RandstrobeIndex] over
+    target proteins and building a single `RandstrobeIndex` (`seroverse.core.seq.kmers.RandstrobeIndex`) over
     target proteins when translations are present) and compares query [`Locus`][seroref.loci.models.Locus]
     or [`Loci`][seroref.loci.models.Loci] instances in parallel via `_match_loci_kernel`.
     """
@@ -1086,7 +1084,7 @@ class LocusMatcher:
         target_names = (
             self.targets.names[out_t]
             if len(self.targets.names) == len(self.targets)
-            else np.full(len(out_t), "", dtype="U1")
+            else np.full(len(out_t), b"", dtype="S1")
         )
         res = Matches(
             query_indices=out_q,
@@ -1136,7 +1134,7 @@ class LocusMatcher:
     def align(
         self,
         query: Locus,
-        target_index: int | str,
+        target_index: int | bytes | str,
         *,
         canonicalize_strand: bool = True,
         heal_mges: bool = False,
@@ -1154,7 +1152,3 @@ class LocusMatcher:
 
         aligner = GraphAligner(cost_strategy=LocusNodeCostStrategy())
         return aligner.align(q_loc, t_loc)
-
-
-LocusMatch = Match
-LocusMatches = Matches

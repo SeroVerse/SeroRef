@@ -1,12 +1,12 @@
-# Contributing to `SeroGen`
+# Contributing to `SeroRef`
 
-Contributions are welcome, and they are greatly appreciated! Every improvement — from bug reports and documentation refinements to Numba kernels and biosynthetic locus archetypes — helps advance open bacterial genomics.
+Contributions are welcome, and they are greatly appreciated! Every improvement — from bug reports and documentation refinements to Numba kernels, biosynthetic locus archetypes, and reference strain curation — helps advance open bacterial genomics.
 
 ## Types of Contributions
 
 ### Report Bugs
 
-Report bugs at https://github.com/SeroVerse/SeroGen/issues.
+Report bugs at https://github.com/SeroVerse/SeroRef/issues.
 
 If you are reporting a bug, please include:
 
@@ -16,21 +16,21 @@ If you are reporting a bug, please include:
 
 ### Fix Bugs & Implement Features
 
-Look through the GitHub issues for open bugs or enhancements at https://github.com/SeroVerse/SeroGen/issues. If you are proposing a new feature:
+Look through the GitHub issues for open bugs or enhancements at https://github.com/SeroVerse/SeroRef/issues. If you are proposing a new feature:
 
-- Explain how it fits into `SeroGen`'s three-layer architecture (`serogen.core`, `serogen.genes`, `serogen.loci`).
+- Explain how it fits into `SeroRef`'s three-layer architecture (`seroref.genes`, `seroref.loci`, `seroref.db`) built on `seroverse.core` and `seroverse.client`.
 - Keep hot-path data structures in contiguous Structure-of-Arrays (SoA) NumPy buffers (`BatchedContainer` / `RaggedArrayContainer`) so Numba kernels remain zero-copy and GIL-free.
-- Preserve strict module boundaries (keep `__init__.py` files empty and use explicit submodule imports).
+- Maintain strict dependency boundaries: `seroref` depends only on `seroverse[all]` (`numpy`, `scipy`, `numba`) and must never import `kbank`, `serogen`, or `kaptive`.
 
 ## Local Development Setup
 
-`SeroGen` uses [`uv`](https://docs.astral.sh/uv/) for dependency and environment management.
+`SeroRef` uses [`uv`](https://docs.astral.sh/uv/) for dependency and environment management.
 
 1. Fork and clone the repository:
 
 ```bash
-git clone git@github.com:YOUR_USERNAME/SeroGen.git
-cd SeroGen
+git clone git@github.com:YOUR_USERNAME/SeroRef.git
+cd SeroRef
 ```
 
 2. Sync all development, test, and documentation dependency groups:
@@ -55,10 +55,10 @@ uv run ruff check .
 uv run ruff format --check .
 
 # 2. Run static type checking with ty
-uv run ty check src/
+uv run ty check src/ tests/
 
 # 3. Run the pytest test suite
-uv run pytest
+uv run pytest -n 0
 
 # 4. Build the Zensical documentation site in strict mode
 uv run zensical build --clean --strict

@@ -19,7 +19,7 @@ class OrfPredictor:
     r"""High-performance Open Reading Frame (ORF) predictor.
 
     Executes Numba JIT-compiled FragGeneScan HMM decoding over single sequences,
-    [`Sequences`][seroverse.core.seq.seq.Sequences], or [`GenomeAssembly`][seroverse.core.genome.GenomeAssembly]
+    `seroverse.core.seq.seq.Sequences`, or `seroverse.core.genome.GenomeAssembly`
     containers using a unified flat window table and Numba `prange` parallelism, returning
     batched [`Genes`][seroref.genes.models.Genes].
 
@@ -35,7 +35,7 @@ class OrfPredictor:
         model: HMM | None = None,
         window_size: int = 50_000,
         overlap: int = 5_000,
-        genetic_code: GeneticCode | int | str = GeneticCode.bacterial,
+        genetic_code: GeneticCode | int | bytes | str = GeneticCode.bacterial,
         min_gene_len: int = 120,
         local_gc_window: int = 4_000,
     ) -> None:
@@ -47,7 +47,7 @@ class OrfPredictor:
                 Set to 0 to disable windowing. Defaults to 50_000.
             overlap (int): Overlap size in base pairs between consecutive windows to ensure seamless
                 gene boundary detection. Defaults to 5_000.
-            genetic_code (GeneticCode | int | str): Translation table (instance, NCBI table ID, or name).
+            genetic_code (GeneticCode | int | bytes | str): Translation table (instance, NCBI table ID, or name).
                 Defaults to `GeneticCode.bacterial` (Table 11).
             min_gene_len (int): Minimum ORF length threshold in base pairs. Defaults to 120 bp.
             local_gc_window (int): Sliding window size in base pairs for local GC bin adaptation.
@@ -56,9 +56,8 @@ class OrfPredictor:
         self.model = model if model is not None else get_hmm_model()
         self.window_size = window_size
         self.overlap = overlap
-        self.genetic_code = (
-            genetic_code if isinstance(genetic_code, GeneticCode) else GeneticCode.from_table(genetic_code)
-        )
+        gc_key = genetic_code.encode("utf-8") if isinstance(genetic_code, str) else genetic_code
+        self.genetic_code = gc_key if isinstance(gc_key, GeneticCode) else GeneticCode.from_table(gc_key)
         self.min_gene_len = int(min_gene_len)
         self.local_gc_window = int(local_gc_window)
 

@@ -1,6 +1,6 @@
 cff-version: 1.2.0
-message: "If you use SeroGen in your work, please cite it using the following metadata."
-title: "SeroGen: Genomic analysis for in silico serotyping"
+message: "If you use SeroRef in your work, please cite it using the following metadata."
+title: "SeroRef: De novo bacterial surface polysaccharide locus prediction and reference strain database"
 type: software
 authors:
   - family-names: "Stanton"
@@ -8,11 +8,12 @@ authors:
     email: "tomdstanton@gmail.com"
     orcid: "https://orcid.org/0000-0002-8898-4432"
     affiliation: "Monash University"
-repository-code: "https://github.com/SeroVerse/SeroGen"
-url: "https://seroverse.github.io/SeroGen/"
+repository-code: "https://github.com/SeroVerse/SeroRef"
+url: "https://seroverse.github.io/SeroRef/"
 license: "GPL-3.0-only"
 keywords:
   - bioinformatics
   - genomics
   - serotyping
   - microbiology
+  - polysaccharide-biosynthesis

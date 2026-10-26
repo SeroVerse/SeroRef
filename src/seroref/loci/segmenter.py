@@ -97,11 +97,11 @@ class LocusSegmenter:
         if n == 0:
             return []
 
-        t = self.classifier.tensors
-        biosyn_prob = probs[:, t.biosynthetic_mask].sum(axis=1)
+        role_specs = GeneRole.specs()
+        biosyn_prob = probs[:, role_specs.biosynthetic_mask].sum(axis=1)
         mge_prob = probs[:, int(GeneRole.TRANSPOSASE)] + probs[:, int(GeneRole.INTEGRASE)]
         is_mge = mge_prob >= self.min_biosynthetic_prob
-        mach_prob = probs[:, t.machinery_roles].sum(axis=1)
+        mach_prob = probs[:, role_specs.machinery_roles].sum(axis=1)
         synth_prob = probs[:, int(GeneRole.TRANSMEMBRANE_SYNTHASE)]
 
         active_indices = np.nonzero(biosyn_prob >= self.min_biosynthetic_prob)[0]
@@ -243,14 +243,14 @@ class LocusSegmenter:
             return i_start, i_end
 
         # Determine dominant strand of core module genes inside [left, right]
-        t = self.classifier.tensors
+        t = self.classifier.specs
         a_id = int(archetype)
         n_m = int(t.num_modules[a_id])
         mod_mask = 0
         for m_i in range(n_m):
             mod_mask |= int(t.module_masks[a_id, m_i])
 
-        mach_set = {int(r) for r in t.machinery_roles}
+        mach_set = {int(r) for r in GeneRole.specs().machinery_roles}
         arch_mach_mask = mod_mask & sum(1 << r for r in mach_set)
 
         # Trim across large inter-operon gaps (>= 2,000 bp) if the outer piece has no archetype machinery
@@ -425,14 +425,14 @@ class LocusSegmenter:
         if m < self.min_locus_genes and not has_island_synth:
             return []
 
-        t = self.classifier.tensors
+        t = self.classifier.specs
         prefixes = self.classifier.precompute_prefixes(island_probs)
         non_unk = island_probs.copy()
         non_unk[:, int(GeneRole.UNKNOWN)] = -1.0
         best_non_unk = np.argmax(non_unk, axis=1).astype(np.int32)
         best_non_unk_prob = np.max(non_unk, axis=1)
         raw_top = np.argmax(island_probs, axis=1).astype(np.int32)
-        biosyn_prob = island_probs[:, t.biosynthetic_mask].sum(axis=1)
+        biosyn_prob = island_probs[:, GeneRole.specs().biosynthetic_mask].sum(axis=1)
         mge_prob = island_probs[:, int(GeneRole.TRANSPOSASE)] + island_probs[:, int(GeneRole.INTEGRASE)]
         is_mge = mge_prob >= self.min_biosynthetic_prob
         top_roles = np.where(
@@ -713,8 +713,7 @@ class LocusSegmenter:
         if len(islands) <= 1:
             return islands
 
-        t = self.classifier.tensors
-        biosyn_prob_all = probs[:, t.biosynthetic_mask].sum(axis=1)
+        biosyn_prob_all = probs[:, GeneRole.specs().biosynthetic_mask].sum(axis=1)
 
         active = list(islands)
         while len(active) > 1:
@@ -1073,14 +1072,13 @@ class LocusSegmenter:
         if len(probs) != n_genes:
             raise ValueError(f"Length of role_probs ({len(probs)}) does not match len(genes) ({n_genes}).")
 
-        t = self.classifier.tensors
         non_unk_probs = probs.copy()
         non_unk_probs[:, int(GeneRole.UNKNOWN)] = -1.0
         best_non_unk_roles = np.argmax(non_unk_probs, axis=1).astype(np.int32)
         best_non_unk_prob = np.max(non_unk_probs, axis=1)
 
         top_roles = np.argmax(probs, axis=1).astype(np.int32)
-        biosyn_prob_all = probs[:, t.biosynthetic_mask].sum(axis=1)
+        biosyn_prob_all = probs[:, GeneRole.specs().biosynthetic_mask].sum(axis=1)
         use_non_unk = (top_roles == int(GeneRole.UNKNOWN)) & (best_non_unk_prob >= self.min_biosynthetic_prob)
         top_roles = np.where(use_non_unk, best_non_unk_roles, top_roles).astype(np.int32)
 

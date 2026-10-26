@@ -153,8 +153,8 @@ class Gene:
     r"""Scalar view of a single predicted gene.
 
     Attributes:
-        interval (Interval): Genomic interval coordinate ([`Interval`][seroverse.core.interval.Interval]).
-        seq (Sequence | None): Coding nucleotide or protein sequence ([`Sequence`][seroverse.core.seq.seq.Sequence]).
+        interval (Interval): Genomic interval coordinate (`seroverse.core.interval.Interval`).
+        seq (Sequence | None): Coding nucleotide or protein sequence (`seroverse.core.seq.seq.Sequence`).
         contig_index (int): 0-based contig index offset corresponding to parent contig name.
         indels (IndelRecord): Scalar frameshift indel record ([`IndelRecord`][seroref.genes.models.IndelRecord]).
         is_partial (bool): True if the ORF is truncated at a contig boundary without a start or stop codon.
@@ -174,13 +174,13 @@ class Genes(BatchedContainer[Gene, "Genes"]):
     Stores interval coordinates, in-frame coding nucleotide sequences, and contig index
     mappings for a collection of predicted Open Reading Frames (ORFs). Inherits
     vectorised slicing and concatenation interface from
-    [`BatchedContainer`][seroverse.core.collections.BatchedContainer].
+    `seroverse.core.collections.BatchedContainer`.
 
     Attributes:
         intervals (Intervals): Genomic interval coordinates for predicted ORFs
-            ([`Intervals`][seroverse.core.interval.Intervals]).
+            (`seroverse.core.interval.Intervals`).
         seqs (Sequences): In-frame coding nucleotide sequences oriented 5' to 3'
-            ([`Sequences`][seroverse.core.seq.seq.Sequences]).
+            (`seroverse.core.seq.seq.Sequences`).
         contig_indices (np.ndarray[tuple[int], np.dtype[np.uint32]]): 1D array of 0-based contig index
             offsets corresponding to parent contig names.
         indels (Indels): Ragged frameshift indel records.
@@ -204,7 +204,7 @@ class Genes(BatchedContainer[Gene, "Genes"]):
         translations: Sequences | None = None,
         _translations: Sequences | None = None,
         is_partial: np.ndarray[tuple[int], np.dtype[np.bool_]] | None = None,
-        genetic_code: GeneticCode | int | str = GeneticCode.bacterial,
+        genetic_code: GeneticCode | int | bytes | str = GeneticCode.bacterial,
     ) -> None:
         r"""Initialize a [`Genes`][seroref.genes.models.Genes] container."""
         n = len(intervals)
@@ -238,10 +238,11 @@ class Genes(BatchedContainer[Gene, "Genes"]):
             "is_partial",
             np.asarray(is_partial, dtype=np.bool_) if is_partial is not None else np.zeros(n, dtype=np.bool_),
         )
+        gc_key = genetic_code.encode("utf-8") if isinstance(genetic_code, str) else genetic_code
         object.__setattr__(
             self,
             "genetic_code",
-            genetic_code if isinstance(genetic_code, GeneticCode) else GeneticCode.from_table(genetic_code),
+            gc_key if isinstance(gc_key, GeneticCode) else GeneticCode.from_table(gc_key),
         )
 
     @property
@@ -259,7 +260,7 @@ class Genes(BatchedContainer[Gene, "Genes"]):
         r"""Translated protein sequences.
 
         Returns pre-computed translations if provided, or computes them lazily using
-        [`self.genetic_code`][seroverse.core.seq.alphabet.GeneticCode].
+        `self.genetic_code` (`seroverse.core.seq.alphabet.GeneticCode`).
 
         Returns:
             Sequences: Protein translation sequences.
@@ -272,11 +273,11 @@ class Genes(BatchedContainer[Gene, "Genes"]):
         object.__setattr__(self, "_translations", translated)
         return translated
 
-    def translate(self, code: GeneticCode | int | str | None = None, to_stop: bool = True) -> Sequences:
+    def translate(self, code: GeneticCode | int | bytes | str | None = None, to_stop: bool = True) -> Sequences:
         r"""Translate coding nucleotide sequences into protein sequences.
 
         Args:
-            code (GeneticCode | int | str | None): Genetic code translation table to use.
+            code (GeneticCode | int | bytes | str | None): Genetic code translation table to use.
                 If None, uses `self.genetic_code`.
             to_stop (bool): If True, truncates translation at the first stop codon (*). Defaults to True.
 
@@ -285,10 +286,11 @@ class Genes(BatchedContainer[Gene, "Genes"]):
         """
         if len(self.seqs) == 0 and self._translations is not None:
             return self._translations
+        c_key = code.encode("utf-8") if isinstance(code, str) else code
         resolved = (
             self.genetic_code
-            if code is None
-            else (code if isinstance(code, GeneticCode) else GeneticCode.from_table(code))
+            if c_key is None
+            else (c_key if isinstance(c_key, GeneticCode) else GeneticCode.from_table(c_key))
         )
         return self.seqs.translate(code=resolved, to_stop=to_stop)
 
