@@ -39,6 +39,9 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Checkout SeroVerse
+        run: git clone --depth 1 https://github.com/SeroVerse/SeroVerse.git ../SeroVerse
+
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
         with:

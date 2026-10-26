@@ -1,4 +1,4 @@
-"""Shared pytest fixtures for SeroGen genome assemblies and predictors."""
+"""Shared pytest fixtures for SeroRef genome assemblies and predictors."""
 
 from pathlib import Path
 
